@@ -1,0 +1,39 @@
+(self) -> None
+
+class CausalMeanValueImputation(MissingValueImputation):
+    """
+    This class replaces each missing value with the average of all the values
+    up to this point.
+
+    (If the first values are missing, they are replaced by the closest non
+    missing value.)
+    """
+
+    def __call__(self, values: np.ndarray) -> np.ndarray:
+        if len(values) == 1 or np.isnan(values).all():
+            return DummyValueImputation()(values)
+        mask = np.isnan(values)
+
+        # we cannot compute the mean with this method if there are nans so we
+        # do a temporary fix of the nan just for the mean computation using
+        # this:
+        last_value_imputation = LastValueImputation()
+        value_no_nans = last_value_imputation(values)
+
+        # We do the cumulative sum shifted by one indices:
+        adjusted_values_to_causality = np.concatenate(
+            (np.repeat(0.0, 1), value_no_nans[:-1])
+        )
+        cumsum = np.cumsum(adjusted_values_to_causality)
+
+        # We get the indices of the elements shifted by one indices:
+        indices = np.linspace(0, len(value_no_nans) - 1, len(value_no_nans))
+
+        ar_res = cumsum / indices.astype(float)
+        values[mask] = ar_res[mask]
+
+        # make sure that we do not leave the potential nan in the first
+        # position:
+        values[0] = value_no_nans[0]
+
+        return values
