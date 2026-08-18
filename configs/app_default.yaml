@@ -1,0 +1,5 @@
+model_dir: weights
+default_model: chronos-2
+python_engine: app/engine/bridge.py
+max_context_length: 2048
+missing_value_policy: nan_only
