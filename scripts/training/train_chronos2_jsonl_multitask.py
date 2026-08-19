@@ -139,6 +139,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-r", type=int, default=2)
     parser.add_argument("--lora-alpha", type=int, default=4)
     parser.add_argument("--lora-dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--lora-target-modules",
+        choices=["output_head", "attention_and_output"],
+        default="output_head",
+    )
     parser.add_argument("--mask-ratio", type=float, default=0.15)
     parser.add_argument("--forecast-loss-weight", type=float, default=1.0)
     parser.add_argument("--recon-loss-weight", type=float, default=0.3)
@@ -166,7 +171,7 @@ def main() -> None:
     config.lora_r = args.lora_r
     config.lora_alpha = args.lora_alpha
     config.lora_dropout = args.lora_dropout
-    config.lora_target_modules = "output_head"
+    config.lora_target_modules = args.lora_target_modules
     config.mask_ratio = args.mask_ratio
     config.forecast_loss_weight = args.forecast_loss_weight
     config.recon_loss_weight = args.recon_loss_weight
