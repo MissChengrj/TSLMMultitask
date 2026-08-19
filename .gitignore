@@ -177,6 +177,7 @@ app/node_modules/
 *.pth
 *.pt
 *.ckpt
+/*.zip
 
 # Kiro IDE
 .kiro

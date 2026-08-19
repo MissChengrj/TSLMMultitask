@@ -13,6 +13,7 @@ splits.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 from collections import defaultdict
@@ -56,6 +57,11 @@ def split_group_keys(keys: list[str], train_ratio: float, val_ratio: float, seed
     return {"train": train, "val": val, "test": test}
 
 
+def stable_seed(base_seed: int, *parts: str) -> int:
+    digest = hashlib.sha256("::".join(parts).encode("utf-8")).hexdigest()
+    return base_seed + int(digest[:8], 16) % 100_000
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Split multitask JSONL data by source_file")
     parser.add_argument("--input-dir", default="data/multitask_eval_all_sources")
@@ -89,7 +95,7 @@ def main() -> None:
                 sorted(groups),
                 train_ratio=args.train_ratio,
                 val_ratio=args.val_ratio,
-                seed=args.seed + abs(hash((source, task))) % 100_000,
+                seed=stable_seed(args.seed, source, task),
             )
 
             task_summary = {
