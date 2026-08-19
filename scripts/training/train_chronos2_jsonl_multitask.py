@@ -143,6 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forecast-loss-weight", type=float, default=1.0)
     parser.add_argument("--recon-loss-weight", type=float, default=0.3)
     parser.add_argument("--use-cpu", action="store_true")
+    parser.add_argument("--skip-final-eval", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -170,6 +171,7 @@ def main() -> None:
     config.forecast_loss_weight = args.forecast_loss_weight
     config.recon_loss_weight = args.recon_loss_weight
     config.use_cpu = args.use_cpu
+    config.skip_final_eval = args.skip_final_eval
     config.seed = args.seed
     config.min_series_length = args.prediction_length + 16
 

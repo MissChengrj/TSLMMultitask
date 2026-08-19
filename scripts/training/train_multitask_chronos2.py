@@ -75,6 +75,7 @@ class TrainConfig:
     lora_dropout: float = 0.1
     lora_target_modules: str = "output_head"
     use_cpu: bool = False
+    skip_final_eval: bool = False
 
     # 掩码参数
     forecast_loss_weight: float = 1.0
@@ -142,6 +143,7 @@ def load_config_from_args() -> TrainConfig:
     parser.add_argument("--lora-dropout", type=float)
     parser.add_argument("--lora-target-modules", choices=["output_head", "attention_and_output"])
     parser.add_argument("--use-cpu", action="store_true")
+    parser.add_argument("--skip-final-eval", action="store_true")
     parser.add_argument("--mask-ratio", type=float)
     parser.add_argument("--forecast-loss-weight", type=float)
     parser.add_argument("--recon-loss-weight", type=float)
@@ -185,6 +187,8 @@ def load_config_from_args() -> TrainConfig:
 
     if args.use_cpu:
         config.use_cpu = True
+    if args.skip_final_eval:
+        config.skip_final_eval = True
 
     return config
 
@@ -635,6 +639,7 @@ def main():
             "lora_dropout": config.lora_dropout,
             "lora_target_modules": config.lora_target_modules,
             "use_cpu": config.use_cpu,
+            "skip_final_eval": config.skip_final_eval,
             "forecast_loss_weight": config.forecast_loss_weight,
             "mask_ratio": config.mask_ratio,
             "recon_loss_weight": config.recon_loss_weight,
@@ -649,12 +654,15 @@ def main():
     with open(output_dir / "training_info.json", 'w', encoding='utf-8') as f:
         json.dump(train_info, f, indent=2, ensure_ascii=False)
 
-    logger.info("进行训练后详细评估...")
-    detailed_metrics = evaluate_model(model, val_series, config)
-    logger.info(f"详细指标: {json.dumps(detailed_metrics, indent=2)}")
+    if config.skip_final_eval:
+        logger.info("跳过训练脚本内置详细评估；请使用 JSONL 评估脚本在测试集上统一评估。")
+    else:
+        logger.info("进行训练后详细评估...")
+        detailed_metrics = evaluate_model(model, val_series, config)
+        logger.info(f"详细指标: {json.dumps(detailed_metrics, indent=2)}")
 
-    with open(output_dir / "evaluation_metrics.json", 'w', encoding='utf-8') as f:
-        json.dump(detailed_metrics, f, indent=2, ensure_ascii=False)
+        with open(output_dir / "evaluation_metrics.json", 'w', encoding='utf-8') as f:
+            json.dump(detailed_metrics, f, indent=2, ensure_ascii=False)
 
     logger.info("=" * 60)
     logger.info("训练完成!")
