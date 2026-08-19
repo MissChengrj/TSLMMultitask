@@ -3,15 +3,19 @@
 
 # Authors: Abdul Fatir Ansari <ansarnd@amazon.com>
 
+import logging
 import warnings
 from typing import TYPE_CHECKING, cast
 
+import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers.trainer import Trainer
 from transformers.trainer_callback import TrainerCallback
 
 if TYPE_CHECKING:
     from chronos.chronos2.dataset import Chronos2Dataset
+
+logger = logging.getLogger(__name__)
 
 
 def seed_worker(worker_id: int):
@@ -42,6 +46,34 @@ class Chronos2Trainer(Trainer):
     A custom trainer based on transformers Trainer. We need to override the dataloader getters because we handle
     batching ourselves in a custom dataset which directly returns batches instead of individual elements.
     """
+
+    def _sanitize_nonfinite_gradients(self, model) -> int:
+        cleaned = 0
+        for param in model.parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            finite_mask = torch.isfinite(grad)
+            if finite_mask.all():
+                continue
+            cleaned += int((~finite_mask).sum().item())
+            grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+        return cleaned
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        try:
+            loss = super().training_step(model, inputs, num_items_in_batch)
+        except TypeError:
+            loss = super().training_step(model, inputs)
+
+        cleaned = self._sanitize_nonfinite_gradients(model)
+        if cleaned:
+            logger.warning(
+                "Sanitized non-finite gradients before clipping: step=%s, cleaned_elements=%s",
+                self.state.global_step,
+                cleaned,
+            )
+        return loss
 
     def get_train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
