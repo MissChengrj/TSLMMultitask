@@ -74,6 +74,8 @@ class TrainConfig:
     lora_alpha: int = 16
     lora_dropout: float = 0.1
     lora_target_modules: str = "output_head"
+    normalized_clip_value: float = 100.0
+    sanitize_nonfinite_grads: bool = True
     use_cpu: bool = False
     skip_final_eval: bool = False
 
@@ -142,6 +144,8 @@ def load_config_from_args() -> TrainConfig:
     parser.add_argument("--lora-alpha", type=int)
     parser.add_argument("--lora-dropout", type=float)
     parser.add_argument("--lora-target-modules", choices=["output_head", "attention_and_output"])
+    parser.add_argument("--normalized-clip-value", type=float)
+    parser.add_argument("--no-sanitize-nonfinite-grads", action="store_true")
     parser.add_argument("--use-cpu", action="store_true")
     parser.add_argument("--skip-final-eval", action="store_true")
     parser.add_argument("--mask-ratio", type=float)
@@ -175,6 +179,7 @@ def load_config_from_args() -> TrainConfig:
         "lora_alpha": "lora_alpha",
         "lora_dropout": "lora_dropout",
         "lora_target_modules": "lora_target_modules",
+        "normalized_clip_value": "normalized_clip_value",
         "mask_ratio": "mask_ratio",
         "forecast_loss_weight": "forecast_loss_weight",
         "recon_loss_weight": "recon_loss_weight",
@@ -189,6 +194,8 @@ def load_config_from_args() -> TrainConfig:
         config.use_cpu = True
     if args.skip_final_eval:
         config.skip_final_eval = True
+    if args.no_sanitize_nonfinite_grads:
+        config.sanitize_nonfinite_grads = False
 
     return config
 
@@ -326,6 +333,36 @@ class MetricsLoggerCallback(TrainerCallback):
     def _save(self):
         with open(self.log_file, 'w', encoding='utf-8') as f:
             json.dump(self.history, f, indent=2, ensure_ascii=False)
+
+
+class FiniteGradientCallback(TrainerCallback):
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.total_cleaned = 0
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+        if not self.enabled or model is None:
+            return
+
+        cleaned = 0
+        for param in model.parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            finite_mask = torch.isfinite(grad)
+            if finite_mask.all():
+                continue
+            cleaned += int((~finite_mask).sum().item())
+            grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
+        if cleaned:
+            self.total_cleaned += cleaned
+            logger.warning(
+                "清理非有限梯度: step=%s, cleaned_elements=%s, total_cleaned=%s",
+                state.global_step,
+                cleaned,
+                self.total_cleaned,
+            )
 
 
 def unwrap_multitask_model(model):
@@ -539,6 +576,7 @@ def main():
     model.forecast_loss_weight = config.forecast_loss_weight
     model.recon_loss_weight = config.recon_loss_weight
     model.mask_ratio = config.mask_ratio
+    model.normalized_clip_value = config.normalized_clip_value
     model = apply_lora_if_requested(model, config)
 
     logger.info("[3/6] 创建训练和验证数据集...")
@@ -594,6 +632,7 @@ def main():
 
     log_file = str(output_dir / "training_log.json")
     metrics_logger = MetricsLoggerCallback(log_file)
+    finite_grad_callback = FiniteGradientCallback(config.sanitize_nonfinite_grads)
 
     logger.info("[5/6] 开始训练...")
     trainer = Chronos2Trainer(
@@ -601,7 +640,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        callbacks=[metrics_logger, EvaluateAndSaveFinalStepCallback()],
+        callbacks=[metrics_logger, finite_grad_callback, EvaluateAndSaveFinalStepCallback()],
     )
 
     train_result = trainer.train()
@@ -638,6 +677,8 @@ def main():
             "lora_alpha": config.lora_alpha,
             "lora_dropout": config.lora_dropout,
             "lora_target_modules": config.lora_target_modules,
+            "normalized_clip_value": config.normalized_clip_value,
+            "sanitize_nonfinite_grads": config.sanitize_nonfinite_grads,
             "use_cpu": config.use_cpu,
             "skip_final_eval": config.skip_final_eval,
             "forecast_loss_weight": config.forecast_loss_weight,

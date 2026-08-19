@@ -18,7 +18,15 @@ class Chronos2MultiTaskModel(Chronos2Model):
         self.forecast_loss_weight = 1.0
         self.recon_loss_weight = 0.5
         self.mask_ratio = 0.15
+        self.normalized_clip_value = 100.0
         self._forced_reconstruction_mask: torch.Tensor | None = None
+
+    def _clip_normalized(self, tensor: torch.Tensor) -> torch.Tensor:
+        clip_value = float(getattr(self, "normalized_clip_value", 0.0) or 0.0)
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+        if clip_value > 0:
+            tensor = tensor.clamp(-clip_value, clip_value)
+        return tensor
 
     def _prepare_patched_context(
         self, context: torch.Tensor, context_mask: torch.Tensor | None = None
@@ -40,7 +48,7 @@ class Chronos2MultiTaskModel(Chronos2Model):
         context = context.to(self.dtype)
         context_mask = context_mask.to(self.dtype)
         context = torch.where(context_mask > 0, context, torch.zeros_like(context))
-        context = torch.nan_to_num(context, nan=0.0, posinf=1e4, neginf=-1e4)
+        context = self._clip_normalized(context)
 
         patched_context = self.patch(context)
         patched_mask = torch.nan_to_num(self.patch(context_mask), nan=0.0)
@@ -105,7 +113,7 @@ class Chronos2MultiTaskModel(Chronos2Model):
                 future_covariates,
                 torch.zeros_like(future_covariates),
             )
-            future_covariates = torch.nan_to_num(future_covariates, nan=0.0, posinf=1e4, neginf=-1e4)
+            future_covariates = self._clip_normalized(future_covariates)
 
             if num_output_patches * output_patch_size > future_covariates.shape[-1]:
                 padding_shape = (
@@ -248,9 +256,9 @@ class Chronos2MultiTaskModel(Chronos2Model):
         ).float()
         loss_mask = valid_mask * mlm_mask_expanded
 
-        target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
+        target = self._clip_normalized(target)
         target = torch.where(loss_mask > 0, target, torch.zeros_like(target))
-        quantile_preds = torch.nan_to_num(quantile_preds, nan=0.0, posinf=1e4, neginf=-1e4)
+        quantile_preds = self._clip_normalized(quantile_preds)
 
         quantiles = rearrange(self.quantiles, "num_quantiles -> 1 num_quantiles 1")
         quantile_loss = 2 * torch.abs(
@@ -298,9 +306,9 @@ class Chronos2MultiTaskModel(Chronos2Model):
         inv_future_covariate_mask = inv_future_covariate_mask[..., :target_length]
 
         loss_mask = future_target_mask & inv_future_covariate_mask & torch.isfinite(quantile_preds).all(dim=1, keepdim=True)
-        future_target = torch.nan_to_num(future_target, nan=0.0, posinf=1e4, neginf=-1e4)
+        future_target = self._clip_normalized(future_target)
         future_target = torch.where(loss_mask, future_target, torch.zeros_like(future_target))
-        quantile_preds = torch.nan_to_num(quantile_preds, nan=0.0, posinf=1e4, neginf=-1e4)
+        quantile_preds = self._clip_normalized(quantile_preds)
 
         quantiles = rearrange(self.quantiles, "num_quantiles -> 1 num_quantiles 1")
         quantile_loss = 2 * torch.abs(
