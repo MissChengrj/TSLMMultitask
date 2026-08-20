@@ -117,7 +117,30 @@ def mse_mae(preds: list[np.ndarray], targets: list[np.ndarray]) -> dict[str, flo
     if not mask.any():
         return {}
     err = p[mask] - y[mask]
-    return {"mse": float(np.mean(err * err)), "mae": float(np.mean(np.abs(err))), "points": int(mask.sum())}
+    normalized_errors = []
+    for pred, target in zip(preds, targets):
+        pred = np.asarray(pred, dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64)
+        pair_mask = np.isfinite(pred) & np.isfinite(target)
+        if not pair_mask.any():
+            continue
+        if target.ndim <= 1:
+            finite_target = target[np.isfinite(target)]
+            q10, q90 = np.quantile(finite_target, [0.1, 0.9])
+            scale = max(float(q90 - q10), float(np.std(finite_target)) * 0.1, 1e-6)
+        else:
+            q10 = np.nanquantile(target, 0.1, axis=-1, keepdims=True)
+            q90 = np.nanquantile(target, 0.9, axis=-1, keepdims=True)
+            scale = np.maximum(q90 - q10, np.nanstd(target, axis=-1, keepdims=True) * 0.1)
+            scale = np.maximum(scale, 1e-6)
+        normalized_errors.append((np.abs(pred - target) / scale)[pair_mask])
+    nmae = float(np.mean(np.concatenate(normalized_errors))) if normalized_errors else float("nan")
+    return {
+        "mse": float(np.mean(err * err)),
+        "mae": float(np.mean(np.abs(err))),
+        "nmae": nmae,
+        "points": int(mask.sum()),
+    }
 
 
 def rank_auc(labels: np.ndarray, scores: np.ndarray) -> float:

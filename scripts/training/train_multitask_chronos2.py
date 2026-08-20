@@ -144,7 +144,10 @@ def load_config_from_args() -> TrainConfig:
     parser.add_argument("--lora-r", type=int)
     parser.add_argument("--lora-alpha", type=int)
     parser.add_argument("--lora-dropout", type=float)
-    parser.add_argument("--lora-target-modules", choices=["output_head", "attention_and_output"])
+    parser.add_argument(
+        "--lora-target-modules",
+        choices=["output_head", "feed_forward_and_output", "attention_and_output"],
+    )
     parser.add_argument("--normalized-clip-value", type=float)
     parser.add_argument("--no-sanitize-nonfinite-grads", action="store_true")
     parser.add_argument("--use-cpu", action="store_true")
@@ -398,9 +401,11 @@ def apply_lora_if_requested(model: Chronos2MultiTaskModel, config: TrainConfig):
         ]
     elif config.lora_target_modules == "output_head":
         target_modules = ["output_patch_embedding.output_layer"]
+    elif config.lora_target_modules == "feed_forward_and_output":
+        target_modules = ["wi", "wo", "output_patch_embedding.output_layer"]
     else:
         raise ValueError(
-            "lora_target_modules 必须是 output_head 或 attention_and_output，"
+            "lora_target_modules 必须是 output_head、feed_forward_and_output 或 attention_and_output，"
             f"当前为: {config.lora_target_modules}"
         )
     lora_config = LoraConfig(

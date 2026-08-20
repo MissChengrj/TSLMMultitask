@@ -145,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.1)
     parser.add_argument(
         "--lora-target-modules",
-        choices=["output_head", "attention_and_output"],
+        choices=["output_head", "feed_forward_and_output", "attention_and_output"],
         default="output_head",
     )
     parser.add_argument("--normalized-clip-value", type=float, default=100.0)
