@@ -117,28 +117,11 @@ def mse_mae(preds: list[np.ndarray], targets: list[np.ndarray]) -> dict[str, flo
     if not mask.any():
         return {}
     err = p[mask] - y[mask]
-    normalized_errors = []
-    for pred, target in zip(preds, targets):
-        pred = np.asarray(pred, dtype=np.float64)
-        target = np.asarray(target, dtype=np.float64)
-        pair_mask = np.isfinite(pred) & np.isfinite(target)
-        if not pair_mask.any():
-            continue
-        if target.ndim <= 1:
-            finite_target = target[np.isfinite(target)]
-            q10, q90 = np.quantile(finite_target, [0.1, 0.9])
-            scale = max(float(q90 - q10), float(np.std(finite_target)) * 0.1, 1e-6)
-        else:
-            q10 = np.nanquantile(target, 0.1, axis=-1, keepdims=True)
-            q90 = np.nanquantile(target, 0.9, axis=-1, keepdims=True)
-            scale = np.maximum(q90 - q10, np.nanstd(target, axis=-1, keepdims=True) * 0.1)
-            scale = np.maximum(scale, 1e-6)
-        normalized_errors.append((np.abs(pred - target) / scale)[pair_mask])
-    nmae = float(np.mean(np.concatenate(normalized_errors))) if normalized_errors else float("nan")
+    smape = 2.0 * np.abs(err) / np.maximum(np.abs(p[mask]) + np.abs(y[mask]), 1e-6)
     return {
         "mse": float(np.mean(err * err)),
         "mae": float(np.mean(np.abs(err))),
-        "nmae": nmae,
+        "smape": float(np.mean(smape)),
         "points": int(mask.sum()),
     }
 
@@ -540,6 +523,7 @@ def main() -> None:
     parser.add_argument("--split-dir", default="data/multitask_eval_splits")
     parser.add_argument("--source", choices=["acars", "qar"], required=True)
     parser.add_argument("--base-model", default="weights/chronos-2")
+    parser.add_argument("--skip-base-model", action="store_true")
     parser.add_argument("--finetuned-model")
     parser.add_argument("--forecast-model")
     parser.add_argument("--interpolation-model")
@@ -562,9 +546,18 @@ def main() -> None:
         neural = train_neural_baselines(split_dir, args.source, args.neural_train_records, pred_len=16, epochs=args.neural_epochs)
 
     results = evaluate_classic(split_dir, args.source, args.max_records_per_task, neural)
-    results.update(
-        evaluate_chronos(split_dir, args.source, "chronos2_base", base_model, base_model, args.max_records_per_task, args.device)
-    )
+    if not args.skip_base_model:
+        results.update(
+            evaluate_chronos(
+                split_dir,
+                args.source,
+                "chronos2_base",
+                base_model,
+                base_model,
+                args.max_records_per_task,
+                args.device,
+            )
+        )
     if args.finetuned_model:
         finetuned = str((PROJECT_ROOT / args.finetuned_model).resolve())
         results.update(
