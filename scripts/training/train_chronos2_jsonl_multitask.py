@@ -83,9 +83,12 @@ def load_jsonl_split(config: TrainConfig):
 
     train_series: list[torch.Tensor] = []
     val_series: list[torch.Tensor] = []
+    selected_task = getattr(config, "selected_task", "all")
+    selected_tasks = TASKS if selected_task == "all" else (selected_task,)
     stats = {
         "source_domain": source,
         "data_mode": "jsonl_multitask",
+        "selected_task": selected_task,
         "max_targets_per_item": max_targets,
         "tasks": {},
         "train_series_count": 0,
@@ -99,7 +102,7 @@ def load_jsonl_split(config: TrainConfig):
         "anomaly_detection": _series_from_anomaly,
     }
     for split_name, bucket in (("train", train_series), ("val", val_series)):
-        for task in TASKS:
+        for task in selected_tasks:
             records = 0
             for row in _read_jsonl(split_dir / source / split_name / f"{task}.jsonl"):
                 tensor = converters[task](row)
@@ -127,6 +130,7 @@ def load_jsonl_split(config: TrainConfig):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chronos2 multitask JSONL fine-tuning")
     parser.add_argument("--source", choices=["acars", "qar"], required=True)
+    parser.add_argument("--task", choices=["all", *TASKS], default="all")
     parser.add_argument("--split-dir", default="data/multitask_eval_splits")
     parser.add_argument("--model-path", default="weights/chronos-2")
     parser.add_argument("--output-dir")
@@ -159,9 +163,11 @@ def main() -> None:
     args = parse_args()
     config = TrainConfig()
     config.source_domain = args.source
+    config.selected_task = args.task
     config.data_dir = str((PROJECT_ROOT / args.split_dir).resolve())
     config.model_path = str((PROJECT_ROOT / args.model_path).resolve())
-    default_out = PROJECT_ROOT / "weights" / f"chronos2_jsonl_{args.source}_multitask"
+    task_suffix = "multitask" if args.task == "all" else args.task
+    default_out = PROJECT_ROOT / "weights" / f"chronos2_jsonl_{args.source}_{task_suffix}"
     config.output_dir = str((PROJECT_ROOT / args.output_dir).resolve()) if args.output_dir else str(default_out)
     config.context_length = args.context_length
     config.prediction_length = args.prediction_length
@@ -179,6 +185,11 @@ def main() -> None:
     config.mask_ratio = args.mask_ratio
     config.forecast_loss_weight = args.forecast_loss_weight
     config.recon_loss_weight = args.recon_loss_weight
+    if args.task == "forecast":
+        config.mask_ratio = 0.0
+        config.recon_loss_weight = 0.0
+    elif args.task in ("interpolation", "anomaly_detection"):
+        config.forecast_loss_weight = 0.0
     config.use_cpu = args.use_cpu
     config.skip_final_eval = args.skip_final_eval
     config.seed = args.seed

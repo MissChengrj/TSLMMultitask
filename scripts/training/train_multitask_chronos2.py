@@ -59,6 +59,7 @@ class TrainConfig:
     val_ratio: float = 0.2           # 验证集比例（8:2划分）
     min_series_length: int = 50      # 最短序列长度
     data_mode: str = "multivariate"  # multivariate: 每个文件作为多传感器序列; single_column: 逐列单变量
+    selected_task: str = "all"       # JSONL workflow: all/forecast/interpolation/anomaly_detection
     max_targets_per_item: int = 16   # 单个 group 的最大变量数，避免低显存 GPU 上 group attention 数值不稳
 
     # 训练超参数
@@ -665,6 +666,7 @@ def main():
                          for k, v in train_result.metrics.items()},
         "config": {
             "data_mode": config.data_mode,
+            "selected_task": getattr(config, "selected_task", "all"),
             "max_targets_per_item": config.max_targets_per_item,
             "context_length": config.context_length,
             "prediction_length": config.prediction_length,

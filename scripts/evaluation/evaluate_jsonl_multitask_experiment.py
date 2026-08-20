@@ -85,6 +85,29 @@ def norm1d(x: np.ndarray) -> tuple[np.ndarray, float, float]:
     return ((fill_linear(x) - mu) / sigma).astype(np.float32), mu, sigma
 
 
+def robust_score_scale(scores: np.ndarray) -> np.ndarray:
+    """Put heterogeneous anomaly scores on a comparable robust scale."""
+    scores = np.asarray(scores, dtype=np.float64)
+    finite = np.isfinite(scores)
+    scaled = np.zeros_like(scores, dtype=np.float64)
+    if not finite.any():
+        return scaled
+    values = scores[finite]
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    scale = max(1.4826 * mad, float(np.std(values)) * 0.1, 1e-6)
+    scaled[finite] = np.clip((values - median) / scale, 0.0, 20.0)
+    return scaled.astype(np.float32)
+
+
+def rolling_zscore(values: np.ndarray) -> np.ndarray:
+    filled = fill_linear(values)
+    baseline = pd.Series(filled).rolling(16, min_periods=4, center=True).median().bfill().ffill().to_numpy()
+    resid = np.abs(filled - baseline)
+    scale = pd.Series(resid).rolling(32, min_periods=8, center=True).std().bfill().ffill().to_numpy()
+    return np.nan_to_num(resid / (scale + 1e-6), nan=0.0, posinf=20.0, neginf=0.0)
+
+
 def mse_mae(preds: list[np.ndarray], targets: list[np.ndarray]) -> dict[str, float]:
     if not preds:
         return {}
@@ -377,10 +400,8 @@ def evaluate_classic(split_dir: Path, source: str, max_records: int | None, neur
             labels = np.asarray(row["labels"].get(col, []), dtype=bool)
             if labels.size == 0:
                 continue
-            baseline = pd.Series(filled[i]).rolling(16, min_periods=4, center=True).median().bfill().ffill().to_numpy()
-            resid = np.abs(filled[i] - baseline)
-            scale = pd.Series(resid).rolling(32, min_periods=8, center=True).std().bfill().ffill().to_numpy()
-            anomaly_acc["rolling_zscore"][0].append(labels); anomaly_acc["rolling_zscore"][1].append(resid / (scale + 1e-6))
+            anomaly_acc["rolling_zscore"][0].append(labels)
+            anomaly_acc["rolling_zscore"][1].append(rolling_zscore(filled[i]))
             if neural:
                 xn, mu, sigma = norm1d(obs[i])
                 rec = predict_nn(neural.lstm_ae, xn) * sigma + mu
@@ -393,34 +414,15 @@ def evaluate_classic(split_dir: Path, source: str, max_records: int | None, neur
     return result
 
 
-def evaluate_chronos(split_dir: Path, source: str, model_name: str, model_path: str, base_model: str, max_records: int | None, device: str) -> dict:
-    model = load_chronos_model(model_path, base_model, device)
-    result = {}
-
-    preds, targets = [], []
-    for row in read_jsonl(split_dir / source / "test" / "forecast.jsonl", max_records):
-        cols = list(row["source_columns"])
-        hist = matrix_from_mapping(row["history"], cols)
-        fut = matrix_from_mapping(row["target_future"], cols)
-        pred = chronos_forecast(model, hist, fut.shape[1])
-        preds.append(pred); targets.append(fut)
-    result[f"{model_name}/forecast"] = mse_mae(preds, targets)
-
-    preds, targets = [], []
-    for row in read_jsonl(split_dir / source / "test" / "interpolation.jsonl", max_records):
-        cols = list(row["source_columns"])
-        obs = matrix_from_mapping(row["observed_context"], cols)
-        mask = ~np.isfinite(obs)
-        rec = chronos_reconstruct(model, obs, mask)
-        for i, col in enumerate(cols):
-            idx = np.asarray(row["missing_indices"].get(col, []), dtype=int)
-            tgt = np.asarray([finite_float(x) for x in row["target_values"].get(col, [])], dtype=np.float32)
-            if len(idx):
-                preds.append(rec[i, idx]); targets.append(tgt)
-    result[f"{model_name}/interpolation"] = mse_mae(preds, targets)
-
-    labels, scores = [], []
-    for row in read_jsonl(split_dir / source / "test" / "anomaly_detection.jsonl", max_records):
+def collect_chronos_anomaly_scores(
+    model,
+    split_dir: Path,
+    source: str,
+    split_name: str,
+    max_records: int | None,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    labels, chronos_scores, rolling_scores = [], [], []
+    for row in read_jsonl(split_dir / source / split_name / "anomaly_detection.jsonl", max_records):
         cols = list(row["source_columns"])
         obs = matrix_from_mapping(row["observed_context"], cols)
         rec = chronos_reconstruct(model, obs, None)
@@ -429,8 +431,73 @@ def evaluate_chronos(split_dir: Path, source: str, model_name: str, model_path: 
             lab = np.asarray(row["labels"].get(col, []), dtype=bool)
             if len(lab):
                 labels.append(lab)
-                scores.append(np.abs(filled[i] - rec[i]))
-    result[f"{model_name}/anomaly_detection"] = anomaly_metrics(labels, scores)
+                chronos_scores.append(robust_score_scale(np.abs(filled[i] - rec[i])))
+                rolling_scores.append(robust_score_scale(rolling_zscore(filled[i])))
+    return labels, chronos_scores, rolling_scores
+
+
+def select_fusion_alpha(
+    labels: list[np.ndarray],
+    chronos_scores: list[np.ndarray],
+    rolling_scores: list[np.ndarray],
+) -> float:
+    best_alpha, best_auc = 0.0, -float("inf")
+    for alpha in np.linspace(0.0, 1.0, 11):
+        fused = [alpha * c + (1.0 - alpha) * r for c, r in zip(chronos_scores, rolling_scores)]
+        auc = anomaly_metrics(labels, fused).get("auroc", float("nan"))
+        if np.isfinite(auc) and auc > best_auc:
+            best_alpha, best_auc = float(alpha), float(auc)
+    return best_alpha
+
+
+def evaluate_chronos(
+    split_dir: Path,
+    source: str,
+    model_name: str,
+    model_path: str,
+    base_model: str,
+    max_records: int | None,
+    device: str,
+    tasks: tuple[str, ...] = TASKS,
+) -> dict:
+    model = load_chronos_model(model_path, base_model, device)
+    result = {}
+
+    if "forecast" in tasks:
+        preds, targets = [], []
+        for row in read_jsonl(split_dir / source / "test" / "forecast.jsonl", max_records):
+            cols = list(row["source_columns"])
+            hist = matrix_from_mapping(row["history"], cols)
+            fut = matrix_from_mapping(row["target_future"], cols)
+            pred = chronos_forecast(model, hist, fut.shape[1])
+            preds.append(pred); targets.append(fut)
+        result[f"{model_name}/forecast"] = mse_mae(preds, targets)
+
+    if "interpolation" in tasks:
+        preds, targets = [], []
+        for row in read_jsonl(split_dir / source / "test" / "interpolation.jsonl", max_records):
+            cols = list(row["source_columns"])
+            obs = matrix_from_mapping(row["observed_context"], cols)
+            mask = ~np.isfinite(obs)
+            rec = chronos_reconstruct(model, obs, mask)
+            for i, col in enumerate(cols):
+                idx = np.asarray(row["missing_indices"].get(col, []), dtype=int)
+                tgt = np.asarray([finite_float(x) for x in row["target_values"].get(col, [])], dtype=np.float32)
+                if len(idx):
+                    preds.append(rec[i, idx]); targets.append(tgt)
+        result[f"{model_name}/interpolation"] = mse_mae(preds, targets)
+
+    if "anomaly_detection" in tasks:
+        val = collect_chronos_anomaly_scores(model, split_dir, source, "val", max_records)
+        alpha = select_fusion_alpha(*val)
+        labels, chronos_scores, rolling_scores = collect_chronos_anomaly_scores(
+            model, split_dir, source, "test", max_records
+        )
+        result[f"{model_name}/anomaly_detection"] = anomaly_metrics(labels, chronos_scores)
+        fused = [alpha * c + (1.0 - alpha) * r for c, r in zip(chronos_scores, rolling_scores)]
+        hybrid_metrics = anomaly_metrics(labels, fused)
+        hybrid_metrics["chronos_weight"] = alpha
+        result[f"{model_name}_hybrid/anomaly_detection"] = hybrid_metrics
     model.to(torch.device("cpu"))
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -451,6 +518,9 @@ def main() -> None:
     parser.add_argument("--source", choices=["acars", "qar"], required=True)
     parser.add_argument("--base-model", default="weights/chronos-2")
     parser.add_argument("--finetuned-model")
+    parser.add_argument("--forecast-model")
+    parser.add_argument("--interpolation-model")
+    parser.add_argument("--anomaly-model")
     parser.add_argument("--output-dir", default="results/multitask_jsonl_experiment")
     parser.add_argument("--max-records-per-task", type=int, default=80)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
@@ -477,6 +547,26 @@ def main() -> None:
         results.update(
             evaluate_chronos(split_dir, args.source, "chronos2_finetuned", finetuned, base_model, args.max_records_per_task, args.device)
         )
+    task_models = {
+        "forecast": args.forecast_model,
+        "interpolation": args.interpolation_model,
+        "anomaly_detection": args.anomaly_model,
+    }
+    for task, model_path in task_models.items():
+        if model_path:
+            resolved = str((PROJECT_ROOT / model_path).resolve())
+            results.update(
+                evaluate_chronos(
+                    split_dir,
+                    args.source,
+                    f"chronos2_{task}_adapter",
+                    resolved,
+                    base_model,
+                    args.max_records_per_task,
+                    args.device,
+                    tasks=(task,),
+                )
+            )
 
     df = flatten_results(args.source, results)
     json_path = output_dir / f"{args.source}_metrics.json"
