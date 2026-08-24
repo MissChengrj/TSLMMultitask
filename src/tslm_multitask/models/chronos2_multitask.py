@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Optional
 
 import torch
 from einops import rearrange, repeat
+from torch import nn
 
 from chronos.chronos2.model import Chronos2Model, Chronos2Output
 
@@ -15,11 +17,137 @@ class Chronos2MultiTaskModel(Chronos2Model):
 
     def __init__(self, config):
         super().__init__(config)
+        vocab_sizes = getattr(config, "aero_metadata_vocab_sizes", {})
+        default_sizes = {
+            "domain": 4,
+            "task": 4,
+            "phase": 16,
+            "channel": 512,
+            "subsystem": 16,
+            "engine": 16,
+            "time_scale": 32,
+            "feature_type": 16,
+            "relation": 256,
+        }
+        self.metadata_embeddings = nn.ModuleDict(
+            {
+                name: nn.Embedding(int(vocab_sizes.get(name, size)), config.d_model)
+                for name, size in default_sizes.items()
+            }
+        )
+        self.metadata_gates = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(())) for name in default_sizes}
+        )
+        # Keep the pretrained future head and isolate masked reconstruction.
+        self.reconstruction_head = copy.deepcopy(self.output_patch_embedding)
         self.forecast_loss_weight = 1.0
         self.recon_loss_weight = 0.5
         self.mask_ratio = 0.15
         self.normalized_clip_value = 100.0
         self._forced_reconstruction_mask: torch.Tensor | None = None
+
+    def _metadata_embedding(
+        self,
+        metadata_ids: dict[str, torch.Tensor] | None,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if not metadata_ids:
+            return None
+        result = torch.zeros(batch_size, self.model_dim, device=device, dtype=dtype)
+        for name, embedding in self.metadata_embeddings.items():
+            ids = metadata_ids.get(name)
+            if ids is None:
+                continue
+            ids = ids.to(device=device, dtype=torch.long)
+            if ids.shape != (batch_size,):
+                raise ValueError(
+                    f"metadata_ids[{name!r}] must have shape {(batch_size,)}, found {tuple(ids.shape)}"
+                )
+            ids = ids.clamp(0, embedding.num_embeddings - 1)
+            gate = torch.tanh(self.metadata_gates[name]).to(dtype=dtype)
+            result = result + gate * embedding(ids).to(dtype=dtype)
+        return result
+
+    def encode(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        future_covariates: torch.Tensor | None = None,
+        future_covariates_mask: torch.Tensor | None = None,
+        num_output_patches: int = 1,
+        future_target: torch.Tensor | None = None,
+        future_target_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+        metadata_ids: dict[str, torch.Tensor] | None = None,
+    ):
+        self._validate_input(
+            context=context,
+            context_mask=context_mask,
+            future_covariates=future_covariates,
+            future_covariates_mask=future_covariates_mask,
+            group_ids=group_ids,
+            num_output_patches=num_output_patches,
+            future_target=future_target,
+            future_target_mask=future_target_mask,
+        )
+        batch_size = context.shape[0]
+        patched_context, attention_mask, loc_scale, mlm_mask = self._prepare_patched_context(
+            context=context, context_mask=context_mask
+        )
+        num_context_patches = attention_mask.shape[-1]
+        input_embeds = self.input_patch_embedding(patched_context)
+        metadata_embedding = self._metadata_embedding(
+            metadata_ids, batch_size, input_embeds.device, input_embeds.dtype
+        )
+        if metadata_embedding is not None:
+            input_embeds = input_embeds + metadata_embedding.unsqueeze(1)
+
+        if self.chronos_config.use_reg_token:
+            reg_input_ids = torch.full(
+                (batch_size, 1), self.config.reg_token_id, device=input_embeds.device
+            )
+            reg_embeds = self.shared(reg_input_ids)
+            if metadata_embedding is not None:
+                reg_embeds = reg_embeds + metadata_embedding.unsqueeze(1)
+            input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
+            attention_mask = torch.cat(
+                [attention_mask.to(self.dtype), torch.ones_like(reg_input_ids).to(self.dtype)],
+                dim=-1,
+            )
+
+        patched_future, patched_future_covariates_mask = self._prepare_patched_future(
+            future_covariates=future_covariates,
+            future_covariates_mask=future_covariates_mask,
+            loc_scale=loc_scale,
+            num_output_patches=num_output_patches,
+            batch_size=batch_size,
+        )
+        future_attention_mask = torch.ones(
+            batch_size, num_output_patches, dtype=self.dtype, device=self.device
+        )
+        future_embeds = self.input_patch_embedding(patched_future)
+        if metadata_embedding is not None:
+            future_embeds = future_embeds + metadata_embedding.unsqueeze(1)
+        input_embeds = torch.cat([input_embeds, future_embeds], dim=-2)
+        attention_mask = torch.cat([attention_mask, future_attention_mask], dim=-1)
+        if group_ids is None:
+            group_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
+        encoder_outputs = self.encoder(
+            attention_mask=attention_mask,
+            inputs_embeds=input_embeds,
+            group_ids=group_ids,
+            output_attentions=output_attentions,
+        )
+        return (
+            encoder_outputs,
+            loc_scale,
+            patched_future_covariates_mask,
+            num_context_patches,
+            mlm_mask,
+        )
 
     def _clip_normalized(self, tensor: torch.Tensor) -> torch.Tensor:
         clip_value = float(getattr(self, "normalized_clip_value", 0.0) or 0.0)
@@ -180,6 +308,7 @@ class Chronos2MultiTaskModel(Chronos2Model):
         reconstruction_mask: torch.Tensor | None = None,
         group_ids: torch.Tensor | None = None,
         output_attentions: bool = False,
+        metadata_ids: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Reconstruct context patches without using the future forecasting head."""
         previous_mask = self._forced_reconstruction_mask
@@ -191,6 +320,7 @@ class Chronos2MultiTaskModel(Chronos2Model):
                 group_ids=group_ids,
                 num_output_patches=1,
                 output_attentions=output_attentions,
+                metadata_ids=metadata_ids,
             )
         finally:
             self._forced_reconstruction_mask = previous_mask
@@ -198,7 +328,7 @@ class Chronos2MultiTaskModel(Chronos2Model):
         hidden_states: torch.Tensor = encoder_outputs[0]
         hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
         recon_embeds = hidden_states[:, :num_context_patches]
-        recon_preds = self.output_patch_embedding(recon_embeds)
+        recon_preds = self.reconstruction_head(recon_embeds)
         recon_preds = rearrange(
             recon_preds,
             "b n (q p) -> b q (n p)",
@@ -225,12 +355,12 @@ class Chronos2MultiTaskModel(Chronos2Model):
     def _compute_mlm_loss(
         self,
         quantile_preds: torch.Tensor,
-        original_context: torch.Tensor,
-        context_mask: torch.Tensor | None,
+        reconstruction_target: torch.Tensor,
+        reconstruction_target_mask: torch.Tensor | None,
         mlm_mask: torch.Tensor,
         loc_scale: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        target, _ = self.instance_norm(original_context, loc_scale)
+        target, _ = self.instance_norm(reconstruction_target, loc_scale)
         target = target.unsqueeze(1).to(self.device)
 
         mlm_mask_expanded = repeat(
@@ -250,8 +380,8 @@ class Chronos2MultiTaskModel(Chronos2Model):
                 context_mask = context_mask[..., -quantile_preds.shape[-1]:]
 
         valid_mask = (
-            context_mask.unsqueeze(1).to(self.device)
-            if context_mask is not None
+            reconstruction_target_mask.unsqueeze(1).to(self.device)
+            if reconstruction_target_mask is not None
             else ~torch.isnan(target)
         ).float()
         loss_mask = valid_mask * mlm_mask_expanded
@@ -329,25 +459,35 @@ class Chronos2MultiTaskModel(Chronos2Model):
         future_target: Optional[torch.Tensor] = None,
         future_target_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
+        metadata_ids: dict[str, torch.Tensor] | None = None,
+        reconstruction_target: Optional[torch.Tensor] = None,
+        reconstruction_target_mask: Optional[torch.Tensor] = None,
+        reconstruction_mask: Optional[torch.Tensor] = None,
     ) -> Chronos2Output:
         batch_size = context.shape[0]
 
-        encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches, mlm_mask = self.encode(
-            context=context,
-            context_mask=context_mask,
-            group_ids=group_ids,
-            future_covariates=future_covariates,
-            future_covariates_mask=future_covariates_mask,
-            num_output_patches=num_output_patches,
-            future_target=future_target,
-            future_target_mask=future_target_mask,
-            output_attentions=output_attentions,
-        )
+        previous_mask = self._forced_reconstruction_mask
+        self._forced_reconstruction_mask = reconstruction_mask
+        try:
+            encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches, mlm_mask = self.encode(
+                context=context,
+                context_mask=context_mask,
+                group_ids=group_ids,
+                future_covariates=future_covariates,
+                future_covariates_mask=future_covariates_mask,
+                num_output_patches=num_output_patches,
+                future_target=future_target,
+                future_target_mask=future_target_mask,
+                output_attentions=output_attentions,
+                metadata_ids=metadata_ids,
+            )
+        finally:
+            self._forced_reconstruction_mask = previous_mask
         hidden_states: torch.Tensor = encoder_outputs[0]
         hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
 
         recon_embeds = hidden_states[:, :num_context_patches]
-        recon_preds = self.output_patch_embedding(recon_embeds)
+        recon_preds = self.reconstruction_head(recon_embeds)
         recon_preds = rearrange(
             recon_preds,
             "b n (q p) -> b q (n p)",
@@ -356,11 +496,19 @@ class Chronos2MultiTaskModel(Chronos2Model):
             p=self.chronos_config.output_patch_size,
         )
 
+        target_for_reconstruction = (
+            reconstruction_target if reconstruction_target is not None else context
+        )
+        mlm_mask_for_loss = (
+            self._coerce_patch_mask(reconstruction_target_mask, num_context_patches, context.device)
+            if reconstruction_target_mask is not None
+            else mlm_mask
+        )
         mlm_loss = self._compute_mlm_loss(
             quantile_preds=recon_preds,
-            original_context=context,
-            context_mask=context_mask,
-            mlm_mask=mlm_mask,
+            reconstruction_target=target_for_reconstruction,
+            reconstruction_target_mask=reconstruction_target_mask,
+            mlm_mask=mlm_mask_for_loss,
             loc_scale=loc_scale,
         )
 

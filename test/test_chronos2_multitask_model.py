@@ -102,6 +102,62 @@ def test_training_backward_with_missing_values_has_finite_gradients():
     assert all(torch.isfinite(grad).all() for grad in gradients)
 
 
+def test_clean_reconstruction_target_keeps_masked_nan_loss_finite():
+    model = Chronos2MultiTaskModel(_dummy_config())
+    model.train()
+    model.forecast_loss_weight = 0.0
+    model.recon_loss_weight = 1.0
+    clean_target = torch.randn(2, 32)
+    reconstruction_mask = torch.zeros_like(clean_target, dtype=torch.bool)
+    reconstruction_mask[:, 8:12] = True
+    context = clean_target.clone()
+    context[reconstruction_mask] = float("nan")
+    context_mask = torch.isfinite(context)
+
+    output = model(
+        context=context,
+        context_mask=context_mask,
+        reconstruction_target=clean_target,
+        reconstruction_target_mask=reconstruction_mask,
+        reconstruction_mask=reconstruction_mask,
+    )
+    output.loss.backward()
+
+    assert torch.isfinite(output.loss)
+    gradients = [param.grad for param in model.parameters() if param.grad is not None]
+    assert gradients
+    assert all(torch.isfinite(grad).all() for grad in gradients)
+
+
+def test_metadata_gates_preserve_base_behavior_until_enabled():
+    model = Chronos2MultiTaskModel(_dummy_config())
+    model.eval()
+    context = torch.randn(2, 32)
+    first_ids = {"domain": torch.tensor([1, 1])}
+    second_ids = {"domain": torch.tensor([2, 2])}
+
+    with torch.no_grad():
+        first = model(context=context, metadata_ids=first_ids).quantile_preds
+        second = model(context=context, metadata_ids=second_ids).quantile_preds
+        model.metadata_gates["domain"].fill_(1.0)
+        enabled = model(context=context, metadata_ids=second_ids).quantile_preds
+
+    assert torch.equal(first, second)
+    assert not torch.equal(first, enabled)
+
+
+def test_reconstruction_head_is_independent_from_forecast_head():
+    model = Chronos2MultiTaskModel(_dummy_config())
+
+    assert model.reconstruction_head is not model.output_patch_embedding
+    assert all(
+        reconstruction is not forecast
+        for reconstruction, forecast in zip(
+            model.reconstruction_head.parameters(), model.output_patch_embedding.parameters()
+        )
+    )
+
+
 def test_multitask_checkpoint_loads_through_default_pipeline(tmp_path):
     model = Chronos2MultiTaskModel(_dummy_config())
     model.save_pretrained(tmp_path)
