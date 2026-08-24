@@ -1216,11 +1216,14 @@ def build_datasets(config: BuildConfig) -> dict:
         encoding="utf-8",
     )
 
-    records_by_domain_task: dict[tuple[str, str], list[dict]] = {}
+    counts: dict[str, dict[str, int]] = {}
+    split_summary: dict[str, dict[str, dict[str, int]]] = {}
     for domain_index, domain in enumerate(DOMAINS):
         domain_sources = [source for source in sources if source.source_domain == domain]
         if not domain_sources:
             continue
+        counts[domain] = {}
+        split_summary[domain] = {}
         domain_config = replace(config, context_length=_context_length_for_domain(config, domain))
         rng = np.random.default_rng(config.seed + domain_index * 100_003)
         builders = {
@@ -1230,21 +1233,22 @@ def build_datasets(config: BuildConfig) -> dict:
         }
         for task, builder in builders.items():
             records = builder(domain_sources, domain_config, rng)
-            records_by_domain_task[(domain, task)] = records
             _write_jsonl(output_dir / "tasks" / domain / f"{task}.jsonl", records)
+            counts[domain][task] = len(records)
+            split_summary[domain][task] = {}
+            for split in ("train", "val", "test"):
+                split_records = [record for record in records if record["split"] == split]
+                split_records.sort(key=lambda record: record["sample_id"])
+                _write_jsonl(
+                    output_dir / "splits" / split / domain / f"{task}.jsonl",
+                    split_records,
+                )
+                split_summary[domain][task][split] = len(split_records)
+            del records
+            del split_records
 
-    split_summary = _write_splits(output_dir, records_by_domain_task, config)
     scalers = _fit_train_scalers(sources, config)
     _write_json(output_dir / "train_scalers.json", scalers)
-    counts = {
-        domain: {
-            task: len(records)
-            for (record_domain, task), records in records_by_domain_task.items()
-            if record_domain == domain
-        }
-        for domain in DOMAINS
-        if any(record_domain == domain for record_domain, _ in records_by_domain_task)
-    }
     manifest = {
         "schema_version": 7,
         "config": asdict(config),
