@@ -460,6 +460,29 @@ def _top_k_f1(labels: list[int], scores: list[float]) -> float:
     return float(2 * precision * recall / max(precision + recall, 1e-12))
 
 
+def _channel_normalized_residual(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    evaluation_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Scale residuals per channel so heterogeneous units do not dominate ranking."""
+    residual = (prediction - target).abs()
+    normalized = torch.full_like(residual, float("nan"))
+    for channel_index in range(target.shape[0]):
+        valid = evaluation_mask[channel_index] & torch.isfinite(target[channel_index])
+        values = target[channel_index][valid]
+        if not valid.any():
+            continue
+        center = values.median()
+        scale = (values - center).abs().median() * 1.4826
+        if not torch.isfinite(scale) or scale <= 1e-6:
+            scale = values.std(unbiased=False)
+        if not torch.isfinite(scale) or scale <= 1e-6:
+            scale = values.abs().mean().clamp_min(1.0)
+        normalized[channel_index] = residual[channel_index] / scale
+    return normalized
+
+
 def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> dict:
     model.eval()
     rng = np.random.default_rng(args.seed + 900_001)
@@ -498,7 +521,10 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                         aggregates[(domain, task, "smape")].extend(smape.cpu().tolist())
                     if task == "anomaly_detection":
                         evaluation_mask = batch["evaluation_mask"] & torch.isfinite(prediction)
-                        scores = (prediction - target).abs()[evaluation_mask]
+                        normalized_residual = _channel_normalized_residual(
+                            prediction, target, evaluation_mask
+                        )
+                        scores = normalized_residual[evaluation_mask]
                         labels = batch["anomaly_labels"][evaluation_mask]
                         aggregates[(domain, task, "scores")].extend(scores.cpu().tolist())
                         aggregates[(domain, task, "labels")].extend(labels.long().cpu().tolist())

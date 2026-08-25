@@ -7,6 +7,7 @@ from chronos.chronos2.config import Chronos2CoreConfig
 from chronos.chronos2.model import Chronos2Model
 from chronos.chronos2.pipeline import Chronos2Pipeline
 from tslm_multitask.models import Chronos2MultiTaskModel
+from scripts.training.train_aero_multitask_chronos2 import _channel_normalized_residual
 
 
 def _dummy_config() -> Chronos2CoreConfig:
@@ -156,6 +157,21 @@ def test_reconstruction_head_is_independent_from_forecast_head():
             model.reconstruction_head.parameters(), model.output_patch_embedding.parameters()
         )
     )
+
+
+def test_anomaly_residual_is_normalized_per_channel():
+    target = torch.tensor(
+        [[0.0, 100.0, 200.0, 300.0], [0.0, 1.0, 2.0, 3.0]]
+    )
+    prediction = target + torch.tensor(
+        [[10.0, 10.0, 10.0, 20.0], [0.1, 0.1, 0.1, 0.2]]
+    )
+    mask = torch.ones_like(target, dtype=torch.bool)
+
+    scores = _channel_normalized_residual(prediction, target, mask)
+
+    assert torch.allclose(scores[0], scores[1], atol=1e-6)
+    assert scores[0, -1] > scores[0, 0]
 
 
 def test_multitask_checkpoint_loads_through_default_pipeline(tmp_path):
