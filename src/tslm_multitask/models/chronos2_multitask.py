@@ -27,6 +27,7 @@ class Chronos2MultiTaskModel(Chronos2Model):
             "engine": 16,
             "time_scale": 32,
             "feature_type": 16,
+            "target_role": 16,
             "relation": 256,
             "time_gap": 16,
         }

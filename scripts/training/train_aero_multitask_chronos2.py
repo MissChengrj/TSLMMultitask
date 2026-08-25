@@ -38,6 +38,7 @@ METADATA_FIELDS = (
     "engine",
     "time_scale",
     "feature_type",
+    "target_role",
     "relation",
     "time_gap",
 )
@@ -166,6 +167,10 @@ class MetadataVocabulary:
             self.add("subsystem", item.get("subsystem"))
             self.add("engine", item.get("engine_id"))
             self.add("feature_type", item.get("feature_type"))
+            self.add(
+                "target_role",
+                f"forecast_{item.get('forecast_tier', 'none')}_anomaly_{item.get('anomaly_tier', 'none')}",
+            )
             for relation in item.get("relation_group_ids") or []:
                 self.add("relation", relation)
         for profile in schema.get("sampling_profiles", {}).values():
@@ -245,6 +250,12 @@ def _metadata_ids(row: dict, vocab: MetadataVocabulary, device: torch.device) ->
         ids["engine"].append(vocab.get("engine", item.get("engine_id")))
         ids["time_scale"].append(vocab.get("time_scale", time_scales.get(column)))
         ids["feature_type"].append(vocab.get("feature_type", item.get("feature_type")))
+        ids["target_role"].append(
+            vocab.get(
+                "target_role",
+                f"forecast_{item.get('forecast_tier', 'none')}_anomaly_{item.get('anomaly_tier', 'none')}",
+            )
+        )
         ids["relation"].append(vocab.get("relation", relations[0] if relations else None))
         ids["time_gap"].append(vocab.get("time_gap", _time_gap_token(row, column)))
     return {
@@ -568,6 +579,95 @@ def _channel_normalized_residual(
     return normalized
 
 
+def _robust_scale(values: torch.Tensor) -> torch.Tensor:
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return torch.as_tensor(1.0, device=values.device if values.numel() else "cpu")
+    scale = (values - values.median()).abs().median() * 1.4826
+    if not torch.isfinite(scale) or scale <= 1e-6:
+        scale = values.std(unbiased=False)
+    if not torch.isfinite(scale) or scale <= 1e-6:
+        scale = values.abs().mean().clamp_min(1.0)
+    return scale
+
+
+def _relation_residuals(
+    row: dict,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    context: torch.Tensor,
+    evaluation_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cross_engine = torch.zeros_like(prediction)
+    physical_response = torch.zeros_like(prediction)
+    metadata = row.get("channel_metadata") or []
+    index_by_name = {name: index for index, name in enumerate(row["source_columns"])}
+    for relation, names in (row.get("relation_groups") or {}).items():
+        indices = [index_by_name[name] for name in names if name in index_by_name]
+        if len(indices) < 2:
+            continue
+        if relation.endswith("_PAIR"):
+            engine_indices = [
+                index for index in indices
+                if metadata[index].get("engine_id") in {1, 2}
+            ]
+            if len(engine_indices) >= 2:
+                left = next((index for index in engine_indices if metadata[index].get("engine_id") == 1), None)
+                right = next((index for index in engine_indices if metadata[index].get("engine_id") == 2), None)
+                if left is not None and right is not None:
+                    valid = (
+                        evaluation_mask[left] & evaluation_mask[right]
+                        & torch.isfinite(target[left]) & torch.isfinite(target[right])
+                    )
+                    if valid.any():
+                        target_delta = target[left] - target[right]
+                        prediction_delta = prediction[left] - prediction[right]
+                        scale = _robust_scale(target_delta[valid])
+                        relation_score = (target_delta - prediction_delta).abs() / scale
+                        cross_engine[left] = torch.where(valid, relation_score, cross_engine[left])
+                        cross_engine[right] = torch.where(valid, relation_score, cross_engine[right])
+        elif "RESPONSE_ENGINE_" in relation:
+            if "N1_COMMAND_RESPONSE_ENGINE_" in relation:
+                condition_variables = {"N1_COMMAND", "N1_TARGET"}
+            elif "TRA_RESPONSE_ENGINE_" in relation:
+                condition_variables = {"TRA"}
+            elif "FMV_RESPONSE_ENGINE_" in relation:
+                condition_variables = {"FMV_POSITION"}
+            elif "N2_CONTROL_RESPONSE_ENGINE_" in relation:
+                condition_variables = {"VSV_POSITION", "VBV_POSITION"}
+            elif "DUCT_PRESSURE_ENGINE_" in relation:
+                condition_variables = {"BLEED_SWITCH"}
+            else:
+                condition_variables = set()
+            response_indices = [
+                index for index in indices
+                if metadata[index].get("anomaly_target")
+                and metadata[index].get("physical_variable") not in condition_variables
+            ]
+            condition_indices = [
+                index for index in indices
+                if metadata[index].get("physical_variable") in condition_variables
+            ]
+            if response_indices and condition_indices:
+                response = response_indices[0]
+                condition = condition_indices[0]
+                valid = (
+                    evaluation_mask[response]
+                    & torch.isfinite(target[response])
+                    & torch.isfinite(target[condition])
+                )
+                if valid.any():
+                    target_response = target[response] - target[condition]
+                    prediction_response = prediction[response] - target[condition]
+                    scale = _robust_scale(target_response[valid])
+                    physical_response[response] = torch.where(
+                        valid,
+                        (target_response - prediction_response).abs() / scale,
+                        physical_response[response],
+                    )
+    return cross_engine, physical_response
+
+
 def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> dict:
     model.eval()
     rng = np.random.default_rng(args.seed + 900_001)
@@ -590,6 +690,14 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                         smape = 2 * error / (prediction[mask].abs() + target[mask].abs()).clamp_min(1e-6)
                         aggregates[(domain, task, "mae")].extend(error.cpu().tolist())
                         aggregates[(domain, task, "smape")].extend(smape.cpu().tolist())
+
+                        for channel_index, item in enumerate(row.get("channel_metadata") or []):
+                            channel_mask = mask[channel_index]
+                            tier = item.get("forecast_tier", "none")
+                            if channel_mask.any() and tier != "none":
+                                aggregates[(domain, task, f"mae_{tier}")].extend(
+                                    (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs().cpu().tolist()
+                                )
                 else:
                     if task == "anomaly_detection" and args.anomaly_inference == "lopo":
                         lopo = model.reconstruct_context_lopo(
@@ -621,9 +729,16 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                         smape = 2 * error / (prediction[mask].abs() + target[mask].abs()).clamp_min(1e-6)
                         aggregates[(domain, task, "mae")].extend(error.cpu().tolist())
                         aggregates[(domain, task, "smape")].extend(smape.cpu().tolist())
+                        for channel_index, item in enumerate(row.get("channel_metadata") or []):
+                            channel_mask = mask[channel_index]
+                            tier = item.get("anomaly_tier", "none")
+                            if channel_mask.any() and tier != "none":
+                                aggregates[(domain, task, f"mae_{tier}")].extend(
+                                    (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs().cpu().tolist()
+                                )
                     if task == "anomaly_detection":
                         evaluation_mask = batch["evaluation_mask"] & torch.isfinite(prediction)
-                        normalized_residual = _channel_normalized_residual(
+                        temporal_residual = _channel_normalized_residual(
                             prediction,
                             target,
                             evaluation_mask,
@@ -631,10 +746,41 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             lower_index=min(range(model.num_quantiles), key=lambda i: abs(model.chronos_config.quantiles[i] - 0.1)),
                             upper_index=min(range(model.num_quantiles), key=lambda i: abs(model.chronos_config.quantiles[i] - 0.9)),
                         )
-                        scores = normalized_residual[evaluation_mask]
+                        cross_engine_residual, physical_response_residual = _relation_residuals(
+                            row,
+                            prediction,
+                            target,
+                            batch["context"],
+                            evaluation_mask,
+                        )
+                        combined_residual = (
+                            temporal_residual
+                            + float(getattr(args, "cross_engine_weight", 0.35)) * cross_engine_residual
+                            + float(getattr(args, "cross_variable_weight", 0.50)) * physical_response_residual
+                        )
+                        scores = combined_residual[evaluation_mask]
                         labels = batch["anomaly_labels"][evaluation_mask]
                         aggregates[(domain, task, "scores")].extend(scores.cpu().tolist())
                         aggregates[(domain, task, "labels")].extend(labels.long().cpu().tolist())
+                        aggregates[(domain, task, "temporal_scores")].extend(
+                            temporal_residual[evaluation_mask].cpu().tolist()
+                        )
+                        aggregates[(domain, task, "cross_engine_scores")].extend(
+                            cross_engine_residual[evaluation_mask].cpu().tolist()
+                        )
+                        aggregates[(domain, task, "physical_response_scores")].extend(
+                            physical_response_residual[evaluation_mask].cpu().tolist()
+                        )
+                        for channel_index, item in enumerate(row.get("channel_metadata") or []):
+                            channel_mask = evaluation_mask[channel_index]
+                            tier = item.get("anomaly_tier", "none")
+                            if channel_mask.any() and tier != "none":
+                                aggregates[(domain, task, f"scores_{tier}")].extend(
+                                    combined_residual[channel_index][channel_mask].cpu().tolist()
+                                )
+                                aggregates[(domain, task, f"labels_{tier}")].extend(
+                                    batch["anomaly_labels"][channel_index][channel_mask].long().cpu().tolist()
+                                )
                         phase = _dominant_phase(row)
                         for channel_index, column in enumerate(row["source_columns"]):
                             channel_mask = evaluation_mask[channel_index]
@@ -646,7 +792,7 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             )
     metrics = {}
     for (domain, task, metric), values in aggregates.items():
-        if metric in {"scores", "labels"}:
+        if "scores" in metric or "labels" in metric:
             continue
         metrics[f"{domain}/{task}/{metric}"] = float(np.mean(values)) if values else float("nan")
     thresholds: dict[str, float] = {}
@@ -690,6 +836,20 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
         if scores and labels:
             metrics[f"{domain}/anomaly_detection/auroc"] = _binary_auc(labels, scores)
             metrics[f"{domain}/anomaly_detection/top_k_f1"] = _top_k_f1(labels, scores)
+            for component, metric_name in (
+                ("temporal_scores", "temporal_auroc"),
+                ("cross_engine_scores", "cross_engine_auroc"),
+                ("physical_response_scores", "physical_response_auroc"),
+            ):
+                component_scores = aggregates.get((domain, "anomaly_detection", component), [])
+                if component_scores and len(component_scores) == len(labels):
+                    metrics[f"{domain}/anomaly_detection/{metric_name}"] = _binary_auc(labels, component_scores)
+            for tier in ("core", "secondary"):
+                tier_scores = aggregates.get((domain, "anomaly_detection", f"scores_{tier}"), [])
+                tier_labels = aggregates.get((domain, "anomaly_detection", f"labels_{tier}"), [])
+                if tier_scores and tier_labels:
+                    metrics[f"{domain}/anomaly_detection/{tier}_auroc"] = _binary_auc(tier_labels, tier_scores)
+                    metrics[f"{domain}/anomaly_detection/{tier}_top_k_f1"] = _top_k_f1(tier_labels, tier_scores)
     return metrics
 
 
@@ -738,6 +898,8 @@ def parse_args():
     parser.add_argument("--amp", choices=["none", "bf16", "fp16"], default="none")
     parser.add_argument("--eval-records", type=int, default=24)
     parser.add_argument("--anomaly-inference", choices=["direct", "lopo"], default="lopo")
+    parser.add_argument("--cross-engine-weight", type=float, default=0.35)
+    parser.add_argument("--cross-variable-weight", type=float, default=0.50)
     parser.add_argument("--log-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")

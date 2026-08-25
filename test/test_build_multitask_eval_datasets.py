@@ -168,6 +168,33 @@ def test_latest_advice_channel_schema_mappings():
     avm = module.channel_metadata("qar", "AVM_SYSTEM_FAULT")
     assert avm["role"] == "label_or_metadata"
     assert avm["anomaly_input"] is False
+    assert avm["forecast_target"] is False
+    assert avm["anomaly_target"] is False
+
+    altitude = module.channel_metadata("qar", "ALT")
+    assert altitude["condition_variable"] is True
+    assert altitude["forecast_target"] is False
+    assert altitude["anomaly_target"] is False
+
+    n1_command = module.channel_metadata("qar", "N1_#1_CMD_INDICATED")
+    assert n1_command["condition_variable"] is True
+    assert n1_command["forecast_target"] is False
+    assert n1_command["anomaly_target"] is False
+
+    n1_actual = module.channel_metadata("qar", "SELECTED_N1_INDICATED_#1")
+    assert n1_actual["forecast_target"] is True
+    assert n1_actual["forecast_tier"] == "core"
+    assert n1_actual["anomaly_target"] is True
+
+    actuator = module.channel_metadata("qar", "SELECTED_FMV_POSITION_#1")
+    assert actuator["forecast_target"] is False
+    assert actuator["anomaly_target"] is True
+    assert actuator["anomaly_tier"] == "secondary"
+
+    vibration = module.channel_metadata("qar", "CN2_(HPC)_VIB_L")
+    assert vibration["forecast_target"] is False
+    assert vibration["anomaly_target"] is True
+    assert vibration["anomaly_tier"] == "core"
 
     acars_divergence = module.channel_metadata("acars", "DEGT_D_SMOOTHED-CRUISE")
     assert acars_divergence["source_variable"] == "DEGT"

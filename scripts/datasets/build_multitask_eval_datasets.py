@@ -38,6 +38,19 @@ GROUPS = {
     "G7": {"subsystem": "DIAGNOSTIC_AUX", "role": "diagnostic_aux"},
 }
 
+# Task boundaries are deliberately narrower than the complete sensor list. A
+# covariate can condition a response target without becoming a health target.
+FORECAST_CORE_VARIABLES = {
+    "EGT", "N1", "N2", "FUEL_FLOW", "PS3", "T25", "OIL_PRESSURE",
+}
+FORECAST_SECONDARY_VARIABLES = {"OIL_TEMPERATURE", "OIL_QUANTITY"}
+ANOMALY_CORE_VARIABLES = FORECAST_CORE_VARIABLES | {
+    "FAN_VIBRATION", "HPC_VIBRATION", "HPT_VIBRATION", "LPT_VIBRATION", "N1_VIBRATION", "N2_VIBRATION",
+}
+ANOMALY_SECONDARY_VARIABLES = {
+    "OIL_TEMPERATURE", "OIL_QUANTITY", "FAN_IMBALANCE_ANGLE", "LPT_IMBALANCE_ANGLE", "FMV_POSITION", "VSV_POSITION", "VBV_POSITION", "DUCT_PRESSURE",
+}
+
 
 @dataclass(frozen=True)
 class BuildConfig:
@@ -272,6 +285,8 @@ def _acars_metadata(column: str) -> dict:
     else:
         group_id = "G7"
         pair_id = None
+    if source_variable in {"ZVB1F", "ZVB1R"}:
+        physical_variable = "FAN_VIBRATION"
 
     relation_group_ids = [pair_id] if pair_id else []
     divergence_group_id = None
@@ -369,13 +384,19 @@ def _qar_metadata(column: str) -> dict:
         )
     elif upper.startswith(("VIB_", "FAN_IMB", "LPT_IMB", "CN1_", "CN2_", "TN1_", "TN2_")):
         group_id = "G5"
-        if upper.startswith(("VIB_N11", "VIB_N12")):
+        if upper.startswith("FAN_IMB"):
+            component = "FAN"
+            physical_variable = "FAN_IMBALANCE_ANGLE"
+        elif upper.startswith("LPT_IMB"):
+            component = "LPT"
+            physical_variable = "LPT_IMBALANCE_ANGLE"
+        elif upper.startswith(("VIB_N11", "VIB_N12")):
             component = "N1"
         elif upper.startswith(("VIB_N21", "VIB_N22")):
             component = "N2"
-        elif upper.startswith("VIB_N1FNT") or upper.startswith("FAN_IMB"):
+        elif upper.startswith("VIB_N1FNT"):
             component = "FAN"
-        elif upper.startswith("LPT_IMB") or upper.startswith("TN1_"):
+        elif upper.startswith("TN1_"):
             component = "LPT"
         elif upper.startswith("CN1_"):
             component = "FAN"
@@ -447,6 +468,21 @@ def _qar_metadata(column: str) -> dict:
         relation_group_ids.append(f"N1_COMMAND_RESPONSE_ENGINE_{engine_id}")
     if group_id == "G6" and physical_variable == "DUCT_PRESSURE" and engine_id in {1, 2}:
         relation_group_ids.append(f"DUCT_PRESSURE_ENGINE_{engine_id}")
+    if group_id == "G1" and physical_variable == "TRA" and engine_id in {1, 2}:
+        relation_group_ids.append(f"TRA_RESPONSE_ENGINE_{engine_id}")
+    if group_id == "G2" and physical_variable in {"EGT", "N1", "N2", "FUEL_FLOW", "PS3", "T25"} and engine_id in {1, 2}:
+        relation_group_ids.append(f"TRA_RESPONSE_ENGINE_{engine_id}")
+    if group_id == "G3" and physical_variable in {"FMV_POSITION", "VSV_POSITION", "VBV_POSITION"} and engine_id in {1, 2}:
+        relation_group_ids.append(
+            f"{'FMV' if physical_variable == 'FMV_POSITION' else 'N2_CONTROL'}_RESPONSE_ENGINE_{engine_id}"
+        )
+    if group_id == "G2" and physical_variable == "FUEL_FLOW" and engine_id in {1, 2}:
+        relation_group_ids.append(f"FMV_RESPONSE_ENGINE_{engine_id}")
+    if group_id == "G2" and physical_variable == "N2" and engine_id in {1, 2}:
+        relation_group_ids.append(f"N2_CONTROL_RESPONSE_ENGINE_{engine_id}")
+    if group_id == "G6" and physical_variable == "BLEED_SWITCH" and engine_id in {1, 2}:
+        relation_group_ids.append(f"DUCT_PRESSURE_ENGINE_{engine_id}")
+
 
     return {
         "channel": column,
@@ -501,6 +537,33 @@ def channel_metadata(domain: str, column: str) -> dict:
             "physical_type": physical_type,
             "relation_group_id": item["pair_id"],
             "relation_group_ids": item.get("relation_group_ids", [item["pair_id"]] if item.get("pair_id") else []),
+        }
+    )
+    return _assign_task_roles(item)
+
+
+def _assign_task_roles(item: dict) -> dict:
+    variable = str(item["physical_variable"]).upper()
+    forecast_tier = (
+        "core" if variable in FORECAST_CORE_VARIABLES
+        else "secondary" if variable in FORECAST_SECONDARY_VARIABLES
+        else "none"
+    )
+    anomaly_tier = (
+        "core" if variable in ANOMALY_CORE_VARIABLES
+        else "secondary" if variable in ANOMALY_SECONDARY_VARIABLES
+        else "none"
+    )
+    label_only = item.get("role") == "label_or_metadata" or item["group_id"] == "G7"
+    item.update(
+        {
+            "condition_variable": bool(item.get("role") in {"covariate", "intermediate"}) and not label_only,
+            "forecast_tier": forecast_tier,
+            "forecast_target": bool(forecast_tier != "none" and item["group_id"] in {"G2", "G4"}),
+            "interpolation_target": bool(anomaly_tier != "none" or item["group_id"] in {"G2", "G4"}),
+            "anomaly_tier": anomaly_tier,
+            "anomaly_target": bool(anomaly_tier != "none" or item.get("role") == "auxiliary_target") and not label_only,
+            "label_only": label_only,
         }
     )
     return item
@@ -628,10 +691,29 @@ def load_source_series(input_dir: Path, config: BuildConfig, catalog: dict[str, 
 
         for group_id, indices in sorted(grouped.items()):
             primary_indices = list(indices)
+            primary_relation_ids = {
+                relation
+                for index in primary_indices
+                for relation in (metadata[index].get("relation_group_ids") or [])
+            }
+            related_indices = [
+                index
+                for index, item in enumerate(metadata)
+                if index not in primary_indices
+                and primary_relation_ids.intersection(item.get("relation_group_ids") or [])
+            ]
+            semantic_indices = primary_indices + related_indices
+            semantic_indices = semantic_indices[: config.max_group_channels]
             if domain == "qar" and group_id != "G0" and condition_indices:
-                available_slots = max(0, config.max_group_channels - len(primary_indices))
+                available_slots = max(0, config.max_group_channels - len(semantic_indices))
+                condition_candidates = [
+                    index for index in condition_indices
+                    if index not in semantic_indices
+                ]
                 condition_count = min(config.max_condition_channels, available_slots)
-                indices = condition_indices[:condition_count] + primary_indices
+                indices = condition_candidates[:condition_count] + semantic_indices
+            else:
+                indices = semantic_indices
             group_values = values[indices]
             group_observation_mask = observation_mask[indices]
             group_native_sampling_mask = native_sampling_mask[indices]
@@ -704,8 +786,23 @@ def _sample_windows(sources: list[SourceSeries], task: str, config: BuildConfig,
 
 
 def _base_record(task: str, index: int, source: SourceSeries, start: int, config: BuildConfig) -> dict:
-    condition_channels = [item["channel"] for item in source.channel_metadata if item["role"] in {"covariate", "auxiliary_target"}]
-    state_channels = [item["channel"] for item in source.channel_metadata if item["role"] in {"target_candidate", "intermediate"}]
+    condition_channels = [
+        item["channel"] for item in source.channel_metadata
+        if item.get("condition_variable")
+    ]
+    forecast_target_channels = [
+        item["channel"] for item in source.channel_metadata
+        if item.get("forecast_target")
+    ]
+    interpolation_target_channels = [
+        item["channel"] for item in source.channel_metadata
+        if item.get("interpolation_target")
+    ]
+    anomaly_target_channels = [
+        item["channel"] for item in source.channel_metadata
+        if item.get("anomaly_target")
+    ]
+    state_channels = interpolation_target_channels
     relation_groups: dict[str, list[str]] = {}
     for item in source.channel_metadata:
         relation_ids = item.get("relation_group_ids") or ([item["relation_group_id"]] if item.get("relation_group_id") else [])
@@ -745,9 +842,24 @@ def _base_record(task: str, index: int, source: SourceSeries, start: int, config
         "relation_groups": relation_groups,
         "condition_channels": condition_channels,
         "state_channels": state_channels,
+        "forecast_target_channels": forecast_target_channels,
+        "interpolation_target_channels": interpolation_target_channels,
+        "anomaly_target_channels": anomaly_target_channels,
         "condition_state_relation": {
             "condition_channels": condition_channels,
             "state_channels": state_channels,
+            "forecast_target_channels": forecast_target_channels,
+            "interpolation_target_channels": interpolation_target_channels,
+            "anomaly_target_channels": anomaly_target_channels,
+        },
+        "target_policy": {
+            "forecast": "forecast_target",
+            "interpolation": "interpolation_target",
+            "anomaly_detection": "anomaly_target",
+            "forecast_core": [item["channel"] for item in source.channel_metadata if item.get("forecast_tier") == "core"],
+            "forecast_secondary": [item["channel"] for item in source.channel_metadata if item.get("forecast_tier") == "secondary"],
+            "anomaly_core": [item["channel"] for item in source.channel_metadata if item.get("anomaly_tier") == "core"],
+            "anomaly_secondary": [item["channel"] for item in source.channel_metadata if item.get("anomaly_tier") == "secondary"],
         },
         "flight_id": source.flight_id,
         "sampling_interval": source.sampling_intervals,
@@ -783,11 +895,10 @@ def build_forecast_records(sources: list[SourceSeries], config: BuildConfig, rng
         history_temporal = _temporal_window_metadata(source, start, context_end)
         target_temporal = _temporal_window_metadata(source, context_end, future_end)
         record = _base_record("forecast", index, source, start, config)
-        has_state_targets = bool(record["state_channels"])
+        has_state_targets = bool(record["forecast_target_channels"])
         forecast_task_mask = {}
         for idx, col in enumerate(source.columns):
-            role = source.channel_metadata[idx]["role"]
-            is_target = role in {"target_candidate", "intermediate"}
+            is_target = bool(source.channel_metadata[idx].get("forecast_target"))
             forecast_task_mask[col] = (
                 future_quality_mask[idx].astype(int).tolist()
                 if is_target or not has_state_targets
@@ -875,7 +986,9 @@ def build_interpolation_records(sources: list[SourceSeries], config: BuildConfig
                     interpolation_mode,
                     rng,
                 )
-                if count and (dropout_channel is None or idx == dropout_channel)
+                if count
+                and source.channel_metadata[idx].get("interpolation_target")
+                and (dropout_channel is None or idx == dropout_channel)
                 else []
             )
             missing_indices[col] = chosen
@@ -920,7 +1033,8 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
             relation_candidates = [
                 index
                 for index, item in enumerate(source.channel_metadata)
-                if any(
+                if item.get("anomaly_target")
+                and any(
                     str(relation).startswith("N1_COMMAND_RESPONSE_ENGINE_")
                     for relation in (item.get("relation_group_ids") or [])
                 )
@@ -928,7 +1042,17 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
             if relation_candidates:
                 cross_channel_index = int(rng.choice(np.asarray(relation_candidates)))
             else:
-                cross_channel_index = 0 if config.anomaly_mode != "mixed" else int(rng.integers(0, len(source.columns)))
+                anomaly_candidates = [
+                    index for index, item in enumerate(source.channel_metadata)
+                    if item.get("anomaly_target")
+                ]
+                cross_channel_index = (
+                    anomaly_candidates[0]
+                    if config.anomaly_mode != "mixed" and anomaly_candidates
+                    else int(rng.choice(np.asarray(anomaly_candidates)))
+                    if anomaly_candidates
+                    else None
+                )
         clean = source.values[:, start : start + config.context_length].copy()
         original_observation_mask = source.observation_mask[:, start : start + config.context_length].copy()
         original_quality_mask = source.quality_mask[:, start : start + config.context_length].copy()
@@ -943,7 +1067,9 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
         for idx, col in enumerate(source.columns):
             valid_candidates = candidates[original_quality_mask[idx, candidates]]
             count = min(max(1, int(round(config.context_length * config.anomaly_ratio))), len(valid_candidates))
-            if cross_channel_index is not None and idx != cross_channel_index:
+            if not source.channel_metadata[idx].get("anomaly_target"):
+                chosen = []
+            elif cross_channel_index is not None and idx != cross_channel_index:
                 chosen = []
             else:
                 selection_mode = "block" if anomaly_mode in {"bias", "drift", "frozen"} else "random_point"
@@ -968,7 +1094,11 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
                     corrupted[idx, chosen] = corrupted[idx, chosen] + offset
             col_labels = np.zeros(config.context_length, dtype=np.int8)
             col_labels[chosen] = 1
-            eval_mask = original_quality_mask[idx].astype(np.int8)
+            eval_mask = (
+                original_quality_mask[idx].astype(np.int8)
+                if source.channel_metadata[idx].get("anomaly_target")
+                else np.zeros(config.context_length, dtype=np.int8)
+            )
             labels[col] = col_labels.tolist()
             anomaly_indices[col] = chosen
             anomaly_values[col] = _json_values(corrupted[idx, chosen])
@@ -1126,11 +1256,18 @@ def _channel_schema(sources: list[SourceSeries]) -> dict:
         profile["time_scale_tokens"] = sorted(profile["time_scale_tokens"])
         profile["mean_native_sampling_ratio"] = profile.pop("native_sampling_ratio_sum") / profile["source_count"]
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "groups": GROUPS,
         "channels": channels,
         "sampling_profiles": sampling_profiles,
         "quality_sentinels": QUALITY_SENTINELS,
+        "task_policy": {
+            "forecast": "forecast_target: core/secondary engine response only",
+            "interpolation": "interpolation_target: health and response channels",
+            "anomaly_detection": "anomaly_target: engine health plus actuator/pneumatic auxiliary channels",
+            "covariates": "condition_variable channels are context-only",
+            "labels": "label_only channels are excluded from model targets and anomaly scores",
+        },
     }
 
 
@@ -1261,7 +1398,7 @@ def build_datasets(config: BuildConfig) -> dict:
     scalers = _fit_train_scalers(sources, config)
     _write_json(output_dir / "train_scalers.json", scalers)
     manifest = {
-        "schema_version": 7,
+        "schema_version": 8,
         "config": asdict(config),
         "source_domains": sorted({source.source_domain for source in sources}),
         "source_catalog": "data/source_catalog.yaml",
@@ -1301,6 +1438,17 @@ def build_datasets(config: BuildConfig) -> dict:
             "recommended": "balanced_domain_task",
             "domain_weights": {"acars": 0.5, "qar": 0.5},
             "generator": "scripts/datasets/canonical_task_generator.py",
+        },
+        "evaluation_policy": {
+            "forecast_primary": sorted(FORECAST_CORE_VARIABLES),
+            "forecast_secondary": sorted(FORECAST_SECONDARY_VARIABLES),
+            "anomaly_primary": sorted(ANOMALY_CORE_VARIABLES),
+            "anomaly_secondary": sorted(ANOMALY_SECONDARY_VARIABLES),
+            "anomaly_score": "temporal residual + cross-engine residual + physical-response residual",
+            "unavailable": [
+                "QAR engine serial isolation requires source_file-to-engine_serial_id mapping",
+                "fault-type metrics require validated physical fault labels",
+            ],
         },
         "paths": {
             "channel_schema": "channel_schema.json",
