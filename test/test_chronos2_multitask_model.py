@@ -159,6 +159,25 @@ def test_reconstruction_head_is_independent_from_forecast_head():
     )
 
 
+def test_base_initialization_copies_head_and_zeros_metadata_gates():
+    model = Chronos2MultiTaskModel(_dummy_config())
+    with torch.no_grad():
+        for gate in model.metadata_gates.values():
+            gate.fill_(123.0)
+        for parameter in model.reconstruction_head.parameters():
+            parameter.zero_()
+
+    model.initialize_aero_modules_from_base()
+
+    assert all(gate.item() == 0.0 for gate in model.metadata_gates.values())
+    assert all(
+        torch.equal(reconstruction, forecast)
+        for reconstruction, forecast in zip(
+            model.reconstruction_head.parameters(), model.output_patch_embedding.parameters()
+        )
+    )
+
+
 def test_anomaly_residual_is_normalized_per_channel():
     target = torch.tensor(
         [[0.0, 100.0, 200.0, 300.0], [0.0, 1.0, 2.0, 3.0]]

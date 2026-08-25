@@ -46,6 +46,13 @@ class Chronos2MultiTaskModel(Chronos2Model):
         self.normalized_clip_value = 100.0
         self._forced_reconstruction_mask: torch.Tensor | None = None
 
+    def initialize_aero_modules_from_base(self) -> None:
+        """Warm-start reconstruction and keep new metadata paths initially inert."""
+        self.reconstruction_head.load_state_dict(self.output_patch_embedding.state_dict())
+        with torch.no_grad():
+            for gate in self.metadata_gates.values():
+                gate.zero_()
+
     def _metadata_embedding(
         self,
         metadata_ids: dict[str, torch.Tensor] | None,

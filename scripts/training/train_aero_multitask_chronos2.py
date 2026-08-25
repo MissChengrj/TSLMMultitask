@@ -613,7 +613,7 @@ def main():
     config.architectures = ["Chronos2MultiTaskModel"]
     model = Chronos2MultiTaskModel.from_pretrained(model_path, config=config).to(device)
     if loading_base_chronos:
-        model.reconstruction_head.load_state_dict(model.output_patch_embedding.state_dict())
+        model.initialize_aero_modules_from_base()
     parameter_stats = configure_trainable(model, args.trainable_mode)
     print(
         json.dumps(
