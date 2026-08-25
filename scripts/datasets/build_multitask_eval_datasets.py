@@ -715,6 +715,11 @@ def _base_record(task: str, index: int, source: SourceSeries, start: int, config
         "sample_id": f"{source.source_domain}_{task}_{index:06d}",
         "task_type": task,
         "source_domain": source.source_domain,
+        "schema_id": (
+            "B-2694" if source.source_domain == "qar" and source.file_path.name.upper().startswith("B-2694_")
+            else "B-1400" if source.source_domain == "qar" and source.file_path.name.upper().startswith("B-1400_")
+            else "ACARS" if source.source_domain == "acars" else "UNKNOWN"
+        ),
         "source_file": source.file_path.name,
         "aircraft_id": source.aircraft_id,
         "source_engine_id": source.source_engine_id,
@@ -910,15 +915,20 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
             if config.anomaly_mode == "mixed"
             else config.anomaly_mode
         )
-        cross_channel_index = (
-            (
-                int(rng.integers(0, len(source.columns)))
-                if config.anomaly_mode == "mixed"
-                else 0
-            )
-            if anomaly_mode == "cross_channel"
-            else None
-        )
+        cross_channel_index = None
+        if anomaly_mode == "cross_channel":
+            relation_candidates = [
+                index
+                for index, item in enumerate(source.channel_metadata)
+                if any(
+                    str(relation).startswith("N1_COMMAND_RESPONSE_ENGINE_")
+                    for relation in (item.get("relation_group_ids") or [])
+                )
+            ]
+            if relation_candidates:
+                cross_channel_index = int(rng.choice(np.asarray(relation_candidates)))
+            else:
+                cross_channel_index = 0 if config.anomaly_mode != "mixed" else int(rng.integers(0, len(source.columns)))
         clean = source.values[:, start : start + config.context_length].copy()
         original_observation_mask = source.observation_mask[:, start : start + config.context_length].copy()
         original_quality_mask = source.quality_mask[:, start : start + config.context_length].copy()
@@ -980,6 +990,7 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
                 "anomaly_ratio": config.anomaly_ratio,
                 "anomaly_sigma": config.anomaly_sigma,
                 "anomaly_mode": anomaly_mode,
+                "anomaly_mechanism": "physical_inconsistency" if anomaly_mode == "cross_channel" else anomaly_mode,
                 "metric_hints": ["precision", "recall", "f1", "auroc_on_observed_points"],
             }
         )

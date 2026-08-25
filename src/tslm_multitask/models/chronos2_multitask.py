@@ -28,6 +28,7 @@ class Chronos2MultiTaskModel(Chronos2Model):
             "time_scale": 32,
             "feature_type": 16,
             "relation": 256,
+            "time_gap": 16,
         }
         self.metadata_embeddings = nn.ModuleDict(
             {
@@ -307,6 +308,34 @@ class Chronos2MultiTaskModel(Chronos2Model):
             "reconstruction mask length must equal number of context patches or context timesteps, "
             f"found {mask.shape[-1]} for {num_context_patches} patches"
         )
+
+    @torch.no_grad()
+    def reconstruct_context_lopo(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        metadata_ids: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Reconstruct each context patch while leaving that patch out of the input."""
+        patch_size = int(self.chronos_config.input_patch_size)
+        num_patches = (context.shape[-1] + patch_size - 1) // patch_size
+        predictions = []
+        for patch_index in range(num_patches):
+            mask = torch.zeros(
+                context.shape[0], num_patches, dtype=torch.bool, device=context.device
+            )
+            mask[:, patch_index] = True
+            predictions.append(
+                self.reconstruct_context(
+                    context=context,
+                    context_mask=context_mask,
+                    reconstruction_mask=mask,
+                    group_ids=group_ids,
+                    metadata_ids=metadata_ids,
+                )
+            )
+        return torch.stack(predictions, dim=1)
 
     def reconstruct_context(
         self,

@@ -39,6 +39,7 @@ METADATA_FIELDS = (
     "time_scale",
     "feature_type",
     "relation",
+    "time_gap",
 )
 
 
@@ -66,9 +67,36 @@ class JsonlIndex:
             return json.loads(stream.readline())
 
 
+class FilteredJsonlIndex:
+    def __init__(self, base: JsonlIndex, indices: list[int]):
+        self.base = base
+        self.indices = indices
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def read(self, index: int) -> dict:
+        return self.base.read(self.indices[index])
+
+
+def _row_schema_id(row: dict) -> str:
+    explicit = row.get("schema_id")
+    if explicit:
+        return str(explicit)
+    if str(row.get("source_domain", "")).lower() == "acars":
+        return "ACARS"
+    source_file = str(row.get("source_file", "")).upper()
+    if source_file.startswith("B-2694_"):
+        return "B-2694"
+    if source_file.startswith("B-1400_"):
+        return "B-1400"
+    return "QAR-OTHER"
+
+
 class CanonicalPools:
     def __init__(self, root: Path, split: str):
         self.pools: dict[tuple[str, str], JsonlIndex] = {}
+        self.schema_pools: dict[tuple[str, str, str], FilteredJsonlIndex] = {}
         for domain in DOMAINS:
             for task in TASKS:
                 path = root / "splits" / split / domain / f"{task}.jsonl"
@@ -76,6 +104,11 @@ class CanonicalPools:
                     pool = JsonlIndex(path)
                     if len(pool):
                         self.pools[(domain, task)] = pool
+                        grouped = defaultdict(list)
+                        for index in range(len(pool)):
+                            grouped[_row_schema_id(pool.read(index))].append(index)
+                        for schema_id, indices in grouped.items():
+                            self.schema_pools[(domain, schema_id, task)] = FilteredJsonlIndex(pool, indices)
 
     def sample(
         self,
@@ -83,17 +116,34 @@ class CanonicalPools:
         tasks: tuple[str, ...],
         domain_weights: dict[str, float],
         task_weights: dict[str, float],
+        schema_weights: dict[str, float] | None = None,
     ) -> dict:
-        domains = [domain for domain in DOMAINS if any((domain, task) in self.pools for task in tasks)]
+        domains = [
+            domain for domain in DOMAINS
+            if any((domain, schema, task) in self.schema_pools
+                   for schema in self.schemas(domain) for task in tasks)
+        ]
         domain_probs = np.asarray([domain_weights.get(domain, 0.0) for domain in domains], dtype=np.float64)
         domain_probs /= domain_probs.sum()
         domain = str(rng.choice(domains, p=domain_probs))
-        available_tasks = [task for task in tasks if (domain, task) in self.pools]
+        available_schemas = self.schemas(domain, tasks)
+        schema_probs = np.asarray(
+            [(schema_weights or {}).get(schema, 1.0) for schema in available_schemas], dtype=np.float64
+        )
+        schema_probs /= schema_probs.sum()
+        schema = str(rng.choice(available_schemas, p=schema_probs))
+        available_tasks = [task for task in tasks if (domain, schema, task) in self.schema_pools]
         task_probs = np.asarray([task_weights.get(task, 0.0) for task in available_tasks], dtype=np.float64)
         task_probs /= task_probs.sum()
         task = str(rng.choice(available_tasks, p=task_probs))
-        pool = self.pools[(domain, task)]
+        pool = self.schema_pools[(domain, schema, task)]
         return pool.read(int(rng.integers(0, len(pool))))
+
+    def schemas(self, domain: str, tasks: tuple[str, ...] = TASKS) -> list[str]:
+        return sorted({
+            schema for candidate_domain, schema, task in self.schema_pools
+            if candidate_domain == domain and task in tasks
+        })
 
 
 class MetadataVocabulary:
@@ -106,6 +156,9 @@ class MetadataVocabulary:
             self.add("domain", value)
         for value in TASKS:
             self.add("task", value)
+        for bucket in range(16):
+            self.add("time_gap", f"gap_{bucket}")
+        self.add("time_gap", "gap_unknown")
         for value in manifest.get("flight_segmentation", {}).get("phase_order", []):
             self.add("phase", value)
         for key, item in schema.get("channels", {}).items():
@@ -156,6 +209,18 @@ def _mask(mapping: dict, columns: list[str]) -> np.ndarray:
     return np.asarray([mapping[column] for column in columns], dtype=bool)
 
 
+def _time_gap_token(row: dict, column: str) -> str:
+    interval = (row.get("sampling_interval") or {}).get(column)
+    try:
+        interval = float(interval)
+    except (TypeError, ValueError):
+        interval = 0.0
+    if not math.isfinite(interval) or interval <= 0:
+        return "gap_unknown"
+    bucket = min(15, max(0, int(math.ceil(math.log2(max(1.0, interval))))))
+    return f"gap_{bucket}"
+
+
 def _dominant_phase(row: dict) -> str:
     if row.get("phase"):
         return str(row["phase"])
@@ -181,6 +246,7 @@ def _metadata_ids(row: dict, vocab: MetadataVocabulary, device: torch.device) ->
         ids["time_scale"].append(vocab.get("time_scale", time_scales.get(column)))
         ids["feature_type"].append(vocab.get("feature_type", item.get("feature_type")))
         ids["relation"].append(vocab.get("relation", relations[0] if relations else None))
+        ids["time_gap"].append(vocab.get("time_gap", _time_gap_token(row, column)))
     return {
         field: torch.as_tensor(ids[field], dtype=torch.long, device=device)
         for field in METADATA_FIELDS
@@ -371,6 +437,7 @@ def train_stage(
             tasks,
             {"acars": args.acars_weight, "qar": args.qar_weight},
             task_weights,
+            {"B-1400": args.qar_b1400_weight, "B-2694": args.qar_b2694_weight, "ACARS": 1.0},
         )
         batch = record_to_batch(row, vocab, model.device, rng, args.masked_anomaly_probability)
         task = str(batch["task"])
@@ -467,21 +534,36 @@ def _channel_normalized_residual(
     prediction: torch.Tensor,
     target: torch.Tensor,
     evaluation_mask: torch.Tensor,
+    quantile_preds: torch.Tensor | None = None,
+    lower_index: int | None = None,
+    upper_index: int | None = None,
 ) -> torch.Tensor:
-    """Scale residuals per channel so heterogeneous units do not dominate ranking."""
+    """Use predictive interval width first, with robust channel fallback."""
     residual = (prediction - target).abs()
     normalized = torch.full_like(residual, float("nan"))
+    interval = None
+    if quantile_preds is not None and lower_index is not None and upper_index is not None:
+        interval = (
+            quantile_preds[:, upper_index, :] - quantile_preds[:, lower_index, :]
+        ).abs().clamp_min(1e-6)
     for channel_index in range(target.shape[0]):
         valid = evaluation_mask[channel_index] & torch.isfinite(target[channel_index])
         values = target[channel_index][valid]
         if not valid.any():
             continue
-        center = values.median()
-        scale = (values - center).abs().median() * 1.4826
-        if not torch.isfinite(scale) or scale <= 1e-6:
-            scale = values.std(unbiased=False)
-        if not torch.isfinite(scale) or scale <= 1e-6:
-            scale = values.abs().mean().clamp_min(1.0)
+        fallback = (values - values.median()).abs().median() * 1.4826
+        if not torch.isfinite(fallback) or fallback <= 1e-6:
+            fallback = values.std(unbiased=False)
+        if not torch.isfinite(fallback) or fallback <= 1e-6:
+            fallback = values.abs().mean().clamp_min(1.0)
+        if interval is None:
+            scale = torch.full_like(residual[channel_index], fallback)
+        else:
+            scale = torch.where(
+                torch.isfinite(interval[channel_index]) & (interval[channel_index] > 1e-6),
+                interval[channel_index],
+                torch.full_like(interval[channel_index], fallback),
+            )
         normalized[channel_index] = residual[channel_index] / scale
     return normalized
 
@@ -490,6 +572,7 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
     model.eval()
     rng = np.random.default_rng(args.seed + 900_001)
     aggregates = defaultdict(list)
+    threshold_groups: dict[str, list[tuple[float, int]]] = defaultdict(list)
     with torch.no_grad():
         for (domain, task), pool in pools.pools.items():
             for index in range(min(args.eval_records, len(pool))):
@@ -508,13 +591,29 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                         aggregates[(domain, task, "mae")].extend(error.cpu().tolist())
                         aggregates[(domain, task, "smape")].extend(smape.cpu().tolist())
                 else:
-                    prediction = model.reconstruct_context(
-                        context=batch["context"],
-                        context_mask=batch["context_mask"],
-                        reconstruction_mask=batch["reconstruction_mask"],
-                        group_ids=batch["group_ids"],
-                        metadata_ids=batch["metadata_ids"],
-                    )[:, _median_index(model), :]
+                    if task == "anomaly_detection" and args.anomaly_inference == "lopo":
+                        lopo = model.reconstruct_context_lopo(
+                            context=batch["context"],
+                            context_mask=batch["context_mask"],
+                            group_ids=batch["group_ids"],
+                            metadata_ids=batch["metadata_ids"],
+                        )
+                        length = lopo.shape[-1]
+                        patch_index = torch.arange(length, device=lopo.device) // int(model.chronos_config.input_patch_size)
+                        patch_index = patch_index.clamp_max(lopo.shape[1] - 1)
+                        batch_index = torch.arange(lopo.shape[0], device=lopo.device)[:, None]
+                        time_index = torch.arange(length, device=lopo.device)[None, :]
+                        quantile_preds = lopo[batch_index, patch_index[None, :], :, time_index]
+                        quantile_preds = quantile_preds.permute(0, 2, 1)
+                    else:
+                        quantile_preds = model.reconstruct_context(
+                            context=batch["context"],
+                            context_mask=batch["context_mask"],
+                            reconstruction_mask=batch["reconstruction_mask"],
+                            group_ids=batch["group_ids"],
+                            metadata_ids=batch["metadata_ids"],
+                        )
+                    prediction = quantile_preds[:, _median_index(model), :]
                     target = batch["reconstruction_target"]
                     mask = batch["reconstruction_target_mask"] & torch.isfinite(prediction)
                     if mask.any():
@@ -525,17 +624,66 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                     if task == "anomaly_detection":
                         evaluation_mask = batch["evaluation_mask"] & torch.isfinite(prediction)
                         normalized_residual = _channel_normalized_residual(
-                            prediction, target, evaluation_mask
+                            prediction,
+                            target,
+                            evaluation_mask,
+                            quantile_preds=quantile_preds,
+                            lower_index=min(range(model.num_quantiles), key=lambda i: abs(model.chronos_config.quantiles[i] - 0.1)),
+                            upper_index=min(range(model.num_quantiles), key=lambda i: abs(model.chronos_config.quantiles[i] - 0.9)),
                         )
                         scores = normalized_residual[evaluation_mask]
                         labels = batch["anomaly_labels"][evaluation_mask]
                         aggregates[(domain, task, "scores")].extend(scores.cpu().tolist())
                         aggregates[(domain, task, "labels")].extend(labels.long().cpu().tolist())
+                        phase = _dominant_phase(row)
+                        for channel_index, column in enumerate(row["source_columns"]):
+                            channel_mask = evaluation_mask[channel_index]
+                            channel_scores = normalized_residual[channel_index][channel_mask]
+                            channel_labels = batch["anomaly_labels"][channel_index][channel_mask]
+                            key = f"{domain}|{column}|{phase}"
+                            threshold_groups[key].extend(
+                                zip(channel_scores.cpu().tolist(), channel_labels.long().cpu().tolist())
+                            )
     metrics = {}
     for (domain, task, metric), values in aggregates.items():
         if metric in {"scores", "labels"}:
             continue
         metrics[f"{domain}/{task}/{metric}"] = float(np.mean(values)) if values else float("nan")
+    thresholds: dict[str, float] = {}
+    threshold_scores: list[float] = []
+    threshold_labels: list[int] = []
+    for key, pairs in threshold_groups.items():
+        normal_scores = [score for score, label in pairs if label == 0 and math.isfinite(score)]
+        if not normal_scores:
+            continue
+        threshold = float(np.percentile(normal_scores, 99.0))
+        thresholds[key] = threshold
+        for score, label in pairs:
+            if math.isfinite(score):
+                threshold_scores.append(score)
+                threshold_labels.append(int(label))
+    if thresholds and threshold_scores:
+        predicted = [
+            score > thresholds.get(key, float("inf"))
+            for key, pairs in threshold_groups.items()
+            for score, _ in pairs
+            if math.isfinite(score)
+        ]
+        labels_flat = [
+            int(label)
+            for key, pairs in threshold_groups.items()
+            for score, label in pairs
+            if math.isfinite(score)
+        ]
+        tp = sum(int(pred and label) for pred, label in zip(predicted, labels_flat))
+        fp = sum(int(pred and not label) for pred, label in zip(predicted, labels_flat))
+        fn = sum(int((not pred) and label) for pred, label in zip(predicted, labels_flat))
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        metrics["anomaly_detection/threshold_f1"] = float(
+            2 * precision * recall / max(precision + recall, 1e-12)
+        )
+        metrics["anomaly_thresholds"] = thresholds
     for domain in DOMAINS:
         scores = aggregates.get((domain, "anomaly_detection", "scores"), [])
         labels = aggregates.get((domain, "anomaly_detection", "labels"), [])
@@ -577,8 +725,11 @@ def parse_args():
         choices=["reconstruction_head", "heads", "adapter_blocks", "full"],
         default="adapter_blocks",
     )
+    parser.add_argument("--stage2-trainable-mode", choices=["same", "reconstruction_head", "heads", "adapter_blocks", "full"], default="reconstruction_head")
     parser.add_argument("--acars-weight", type=float, default=0.5)
     parser.add_argument("--qar-weight", type=float, default=0.5)
+    parser.add_argument("--qar-b1400-weight", type=float, default=0.5)
+    parser.add_argument("--qar-b2694-weight", type=float, default=0.5)
     parser.add_argument("--forecast-weight", type=float, default=0.40)
     parser.add_argument("--interpolation-weight", type=float, default=0.35)
     parser.add_argument("--anomaly-weight", type=float, default=0.25)
@@ -586,6 +737,7 @@ def parse_args():
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--amp", choices=["none", "bf16", "fp16"], default="none")
     parser.add_argument("--eval-records", type=int, default=24)
+    parser.add_argument("--anomaly-inference", choices=["direct", "lopo"], default="lopo")
     parser.add_argument("--log-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
@@ -657,6 +809,10 @@ def main():
     )
     stage1_metrics = evaluate(model, val_pools, vocab, args)
     save_checkpoint(model, output_root / "checkpoint-stage1", vocab, args, history, stage1_metrics)
+
+    if args.stage2_trainable_mode != "same":
+        configure_trainable(model, args.stage2_trainable_mode)
+        optimizer = make_optimizer(model, args.backbone_learning_rate, args.new_module_learning_rate)
 
     global_step = train_stage(
         model,
