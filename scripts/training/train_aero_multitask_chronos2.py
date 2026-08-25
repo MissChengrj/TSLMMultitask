@@ -299,14 +299,17 @@ def configure_trainable(model: Chronos2MultiTaskModel, mode: str) -> dict[str, i
     else:
         for parameter in model.parameters():
             parameter.requires_grad = False
-        prefixes = [
-            "output_patch_embedding",
-            "reconstruction_head",
-            "metadata_embeddings",
-            "metadata_gates",
-        ]
-        if mode == "adapter_blocks":
-            prefixes.append("input_patch_embedding")
+        if mode == "reconstruction_head":
+            prefixes = ["reconstruction_head"]
+        else:
+            prefixes = [
+                "output_patch_embedding",
+                "reconstruction_head",
+                "metadata_embeddings",
+                "metadata_gates",
+            ]
+            if mode == "adapter_blocks":
+                prefixes.append("input_patch_embedding")
         for name, parameter in model.named_parameters():
             if any(name.startswith(prefix) for prefix in prefixes):
                 parameter.requires_grad = True
@@ -569,7 +572,11 @@ def parse_args():
     parser.add_argument("--gradient-accumulation", type=int, default=2)
     parser.add_argument("--backbone-learning-rate", type=float, default=1e-5)
     parser.add_argument("--new-module-learning-rate", type=float, default=5e-5)
-    parser.add_argument("--trainable-mode", choices=["heads", "adapter_blocks", "full"], default="adapter_blocks")
+    parser.add_argument(
+        "--trainable-mode",
+        choices=["reconstruction_head", "heads", "adapter_blocks", "full"],
+        default="adapter_blocks",
+    )
     parser.add_argument("--acars-weight", type=float, default=0.5)
     parser.add_argument("--qar-weight", type=float, default=0.5)
     parser.add_argument("--forecast-weight", type=float, default=0.40)

@@ -7,7 +7,10 @@ from chronos.chronos2.config import Chronos2CoreConfig
 from chronos.chronos2.model import Chronos2Model
 from chronos.chronos2.pipeline import Chronos2Pipeline
 from tslm_multitask.models import Chronos2MultiTaskModel
-from scripts.training.train_aero_multitask_chronos2 import _channel_normalized_residual
+from scripts.training.train_aero_multitask_chronos2 import (
+    _channel_normalized_residual,
+    configure_trainable,
+)
 
 
 def _dummy_config() -> Chronos2CoreConfig:
@@ -176,6 +179,18 @@ def test_base_initialization_copies_head_and_zeros_metadata_gates():
             model.reconstruction_head.parameters(), model.output_patch_embedding.parameters()
         )
     )
+
+
+def test_reconstruction_only_mode_preserves_forecast_parameters():
+    model = Chronos2MultiTaskModel(_dummy_config())
+
+    configure_trainable(model, "reconstruction_head")
+
+    trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    assert trainable
+    assert all(name.startswith("reconstruction_head") for name in trainable)
+    assert not any(name.startswith("output_patch_embedding") for name in trainable)
+    assert not any(name.startswith("input_patch_embedding") for name in trainable)
 
 
 def test_anomaly_residual_is_normalized_per_channel():
