@@ -672,7 +672,23 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
     model.eval()
     rng = np.random.default_rng(args.seed + 900_001)
     aggregates = defaultdict(list)
+    feature_aggregates = defaultdict(lambda: defaultdict(list))
+    feature_metadata = {}
     threshold_groups: dict[str, list[tuple[float, int]]] = defaultdict(list)
+
+    def feature_key(domain: str, row: dict, channel_index: int) -> str:
+        column = row["source_columns"][channel_index]
+        item = (row.get("channel_metadata") or [])[channel_index]
+        key = f"{domain}|{item.get('physical_variable', column)}|{column}"
+        feature_metadata[key] = {
+            "domain": domain,
+            "channel": column,
+            "physical_variable": item.get("physical_variable", column),
+            "engine_id": item.get("engine_id"),
+            "forecast_tier": item.get("forecast_tier", "none"),
+            "anomaly_tier": item.get("anomaly_tier", "none"),
+        }
+        return key
     with torch.no_grad():
         for (domain, task), pool in pools.pools.items():
             for index in range(min(args.eval_records, len(pool))):
@@ -695,8 +711,12 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             channel_mask = mask[channel_index]
                             tier = item.get("forecast_tier", "none")
                             if channel_mask.any() and tier != "none":
-                                aggregates[(domain, task, f"mae_{tier}")].extend(
-                                    (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs().cpu().tolist()
+                                channel_error = (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs()
+                                aggregates[(domain, task, f"mae_{tier}")].extend(channel_error.cpu().tolist())
+                                key = feature_key(domain, row, channel_index)
+                                feature_aggregates[key]["forecast_error"].extend(channel_error.cpu().tolist())
+                                feature_aggregates[key]["forecast_smape"].extend(
+                                    (2 * channel_error / (prediction[channel_index][channel_mask].abs() + target[channel_index][channel_mask].abs()).clamp_min(1e-6)).cpu().tolist()
                                 )
                 else:
                     if task == "anomaly_detection" and args.anomaly_inference == "lopo":
@@ -733,8 +753,12 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             channel_mask = mask[channel_index]
                             tier = item.get("anomaly_tier", "none")
                             if channel_mask.any() and tier != "none":
-                                aggregates[(domain, task, f"mae_{tier}")].extend(
-                                    (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs().cpu().tolist()
+                                channel_error = (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs()
+                                aggregates[(domain, task, f"mae_{tier}")].extend(channel_error.cpu().tolist())
+                                key = feature_key(domain, row, channel_index)
+                                feature_aggregates[key]["interpolation_error"].extend(channel_error.cpu().tolist())
+                                feature_aggregates[key]["interpolation_smape"].extend(
+                                    (2 * channel_error / (prediction[channel_index][channel_mask].abs() + target[channel_index][channel_mask].abs()).clamp_min(1e-6)).cpu().tolist()
                                 )
                     if task == "anomaly_detection":
                         evaluation_mask = batch["evaluation_mask"] & torch.isfinite(prediction)
@@ -775,6 +799,22 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             channel_mask = evaluation_mask[channel_index]
                             tier = item.get("anomaly_tier", "none")
                             if channel_mask.any() and tier != "none":
+                                key = feature_key(domain, row, channel_index)
+                                feature_aggregates[key]["anomaly_scores"].extend(
+                                    combined_residual[channel_index][channel_mask].cpu().tolist()
+                                )
+                                feature_aggregates[key]["anomaly_labels"].extend(
+                                    batch["anomaly_labels"][channel_index][channel_mask].long().cpu().tolist()
+                                )
+                                feature_aggregates[key]["temporal_scores"].extend(
+                                    temporal_residual[channel_index][channel_mask].cpu().tolist()
+                                )
+                                feature_aggregates[key]["cross_engine_scores"].extend(
+                                    cross_engine_residual[channel_index][channel_mask].cpu().tolist()
+                                )
+                                feature_aggregates[key]["physical_response_scores"].extend(
+                                    physical_response_residual[channel_index][channel_mask].cpu().tolist()
+                                )
                                 aggregates[(domain, task, f"scores_{tier}")].extend(
                                     combined_residual[channel_index][channel_mask].cpu().tolist()
                                 )
@@ -784,7 +824,7 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                         phase = _dominant_phase(row)
                         for channel_index, column in enumerate(row["source_columns"]):
                             channel_mask = evaluation_mask[channel_index]
-                            channel_scores = normalized_residual[channel_index][channel_mask]
+                            channel_scores = combined_residual[channel_index][channel_mask]
                             channel_labels = batch["anomaly_labels"][channel_index][channel_mask]
                             key = f"{domain}|{column}|{phase}"
                             threshold_groups[key].extend(
@@ -850,6 +890,33 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                 if tier_scores and tier_labels:
                     metrics[f"{domain}/anomaly_detection/{tier}_auroc"] = _binary_auc(tier_labels, tier_scores)
                     metrics[f"{domain}/anomaly_detection/{tier}_top_k_f1"] = _top_k_f1(tier_labels, tier_scores)
+    per_feature = {}
+    for key, values in feature_aggregates.items():
+        entry = dict(feature_metadata[key])
+        if values.get("forecast_error"):
+            entry["forecast"] = {
+                "count": len(values["forecast_error"]),
+                "mae": float(np.mean(values["forecast_error"])),
+                "smape": float(np.mean(values["forecast_smape"])),
+            }
+        if values.get("interpolation_error"):
+            entry["interpolation"] = {
+                "count": len(values["interpolation_error"]),
+                "mae": float(np.mean(values["interpolation_error"])),
+                "smape": float(np.mean(values["interpolation_smape"])),
+            }
+        if values.get("anomaly_scores") and values.get("anomaly_labels"):
+            entry["anomaly_detection"] = {
+                "count": len(values["anomaly_scores"]),
+                "positive_count": int(sum(values["anomaly_labels"])),
+                "auroc": _binary_auc(values["anomaly_labels"], values["anomaly_scores"]),
+                "top_k_f1": _top_k_f1(values["anomaly_labels"], values["anomaly_scores"]),
+                "temporal_auroc": _binary_auc(values["anomaly_labels"], values["temporal_scores"]),
+                "cross_engine_auroc": _binary_auc(values["anomaly_labels"], values["cross_engine_scores"]),
+                "physical_response_auroc": _binary_auc(values["anomaly_labels"], values["physical_response_scores"]),
+            }
+        per_feature[key] = entry
+    metrics["per_feature"] = per_feature
     return metrics
 
 
