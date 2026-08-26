@@ -672,6 +672,8 @@ def _relation_residuals(
                 condition_variables = {"FMV_POSITION"}
             elif "N2_CONTROL_RESPONSE_ENGINE_" in relation:
                 condition_variables = {"VSV_POSITION", "VBV_POSITION"}
+            elif "N2_RESPONSE_ENGINE_" in relation:
+                condition_variables = {"N2"}
             elif "DUCT_PRESSURE_ENGINE_" in relation:
                 condition_variables = {"BLEED_SWITCH"}
             else:
