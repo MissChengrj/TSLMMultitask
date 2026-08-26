@@ -41,9 +41,11 @@ GROUPS = {
 # Task boundaries are deliberately narrower than the complete sensor list. A
 # covariate can condition a response target without becoming a health target.
 FORECAST_CORE_VARIABLES = {
-    "EGT", "N1", "N2", "FUEL_FLOW", "PS3", "T25", "OIL_PRESSURE",
+    "EGT", "N1", "N2", "FUEL_FLOW", "PS3", "T25",
 }
-FORECAST_SECONDARY_VARIABLES = {"OIL_TEMPERATURE", "OIL_QUANTITY"}
+FORECAST_SECONDARY_VARIABLES = {
+    "OIL_PRESSURE", "OIL_TEMPERATURE", "OIL_QUANTITY",
+}
 ANOMALY_CORE_VARIABLES = FORECAST_CORE_VARIABLES | {
     "FAN_VIBRATION", "HPC_VIBRATION", "HPT_VIBRATION", "LPT_VIBRATION", "N1_VIBRATION", "N2_VIBRATION",
 }
@@ -480,6 +482,8 @@ def _qar_metadata(column: str) -> dict:
         relation_group_ids.append(f"FMV_RESPONSE_ENGINE_{engine_id}")
     if group_id == "G2" and physical_variable == "N2" and engine_id in {1, 2}:
         relation_group_ids.append(f"N2_CONTROL_RESPONSE_ENGINE_{engine_id}")
+    if group_id == "G2" and physical_variable in {"N2", "PS3"} and engine_id in {1, 2}:
+        relation_group_ids.append(f"N2_RESPONSE_ENGINE_{engine_id}")
     if group_id == "G6" and physical_variable == "BLEED_SWITCH" and engine_id in {1, 2}:
         relation_group_ids.append(f"DUCT_PRESSURE_ENGINE_{engine_id}")
 
@@ -704,6 +708,13 @@ def load_source_series(input_dir: Path, config: BuildConfig, catalog: dict[str, 
             ]
             semantic_indices = primary_indices + related_indices
             semantic_indices = semantic_indices[: config.max_group_channels]
+            if not any(
+                metadata[index].get("forecast_target")
+                or metadata[index].get("interpolation_target")
+                or metadata[index].get("anomaly_target")
+                for index in semantic_indices
+            ):
+                continue
             if domain == "qar" and group_id != "G0" and condition_indices:
                 available_slots = max(0, config.max_group_channels - len(semantic_indices))
                 condition_candidates = [
@@ -923,7 +934,7 @@ def build_forecast_records(sources: list[SourceSeries], config: BuildConfig, rng
                 "target_availability_mask": target_temporal["availability_mask"],
                 "target_time_delta": target_temporal["time_delta"],
                 "task_mask": forecast_task_mask,
-                "metric_hints": ["mae_on_observed_future", "rmse_on_observed_future", "smape_on_observed_future"],
+                "metric_hints": ["smae_on_observed_future", "smape_on_observed_future"],
             }
         )
         records.append(record)
@@ -1013,7 +1024,7 @@ def build_interpolation_records(sources: list[SourceSeries], config: BuildConfig
                 "task_mask": evaluation_masks,
                 "mask_ratio": config.interpolation_mask_ratio,
                 "interpolation_mode": interpolation_mode,
-                "metric_hints": ["mae_on_masked_observed", "rmse_on_masked_observed"],
+                "metric_hints": ["smae_on_masked_observed", "smape_on_masked_observed"],
             }
         )
         records.append(record)

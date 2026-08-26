@@ -153,6 +153,9 @@ class MetadataVocabulary:
         self.index = {field: {"<UNK>": 0} for field in METADATA_FIELDS}
         schema = json.loads((dataset_root / "channel_schema.json").read_text(encoding="utf-8"))
         manifest = json.loads((dataset_root / "dataset_manifest.json").read_text(encoding="utf-8"))
+        scaler_path = dataset_root / "train_scalers.json"
+        scaler_payload = json.loads(scaler_path.read_text(encoding="utf-8")) if scaler_path.exists() else {}
+        self.train_scalers = scaler_payload.get("scalers", {})
         for value in ("ACARS", "QAR"):
             self.add("domain", value)
         for value in TASKS:
@@ -176,6 +179,40 @@ class MetadataVocabulary:
         for profile in schema.get("sampling_profiles", {}).values():
             for token in profile.get("time_scale_tokens", []):
                 self.add("time_scale", token)
+
+    def smae_scale(self, row: dict, item: dict, values: torch.Tensor | None = None) -> torch.Tensor:
+        domain = str(item.get("domain") or row.get("source_domain") or "").upper()
+        phase = item.get("phase") or row.get("phase") or "UNSPECIFIED"
+        key = (
+            f"{domain}::{item.get('canonical_variable', item.get('physical_variable', 'UNKNOWN'))}::"
+            f"{item.get('engine_id', 'global')}::{item.get('feature_type', 'raw')}::"
+            f"{item.get('delta_semantics', 'none')}::{item.get('transformation', 'none')}::{phase}"
+        )
+        stats = self.train_scalers.get(key, {})
+        preferred = (
+            (stats.get("iqr"), stats.get("std"), stats.get("mean_abs"))
+            if domain == "ACARS"
+            else (stats.get("std"), stats.get("mean_abs"), stats.get("iqr"))
+        )
+        device = values.device if values is not None else torch.device("cpu")
+        for candidate in preferred:
+            try:
+                candidate = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(candidate) and candidate > 1e-8:
+                return torch.as_tensor(candidate, dtype=torch.float32, device=device)
+        if values is not None:
+            finite = values[torch.isfinite(values)]
+            if finite.numel():
+                scale = (finite - finite.median()).abs().median() * 1.4826
+                if not torch.isfinite(scale) or scale <= 1e-8:
+                    scale = finite.std(unbiased=False)
+                if not torch.isfinite(scale) or scale <= 1e-8:
+                    scale = finite.abs().mean()
+                if torch.isfinite(scale) and scale > 1e-8:
+                    return scale
+        return torch.as_tensor(1.0, dtype=torch.float32, device=device)
 
     def add(self, field: str, value) -> int:
         value = "<UNK>" if value is None or value == "" else str(value)
@@ -702,22 +739,24 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                     target = batch["future_target"]
                     mask = batch["future_target_mask"] & torch.isfinite(prediction)
                     if mask.any():
-                        error = (prediction[mask] - target[mask]).abs()
-                        smape = 2 * error / (prediction[mask].abs() + target[mask].abs()).clamp_min(1e-6)
-                        aggregates[(domain, task, "mae")].extend(error.cpu().tolist())
-                        aggregates[(domain, task, "smape")].extend(smape.cpu().tolist())
-
                         for channel_index, item in enumerate(row.get("channel_metadata") or []):
                             channel_mask = mask[channel_index]
+                            if not channel_mask.any():
+                                continue
+                            channel_error = (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs()
+                            scale = vocab.smae_scale(row, item, target[channel_index][channel_mask])
+                            channel_smae = channel_error / scale
+                            channel_smape = 2 * channel_error / (
+                                prediction[channel_index][channel_mask].abs() + target[channel_index][channel_mask].abs()
+                            ).clamp_min(1e-6)
+                            aggregates[(domain, task, "smae")].extend(channel_smae.cpu().tolist())
+                            aggregates[(domain, task, "smape")].extend(channel_smape.cpu().tolist())
+                            key = feature_key(domain, row, channel_index)
+                            feature_aggregates[key]["forecast_smae"].extend(channel_smae.cpu().tolist())
+                            feature_aggregates[key]["forecast_smape"].extend(channel_smape.cpu().tolist())
                             tier = item.get("forecast_tier", "none")
-                            if channel_mask.any() and tier != "none":
-                                channel_error = (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs()
-                                aggregates[(domain, task, f"mae_{tier}")].extend(channel_error.cpu().tolist())
-                                key = feature_key(domain, row, channel_index)
-                                feature_aggregates[key]["forecast_error"].extend(channel_error.cpu().tolist())
-                                feature_aggregates[key]["forecast_smape"].extend(
-                                    (2 * channel_error / (prediction[channel_index][channel_mask].abs() + target[channel_index][channel_mask].abs()).clamp_min(1e-6)).cpu().tolist()
-                                )
+                            if tier != "none":
+                                aggregates[(domain, task, f"smae_{tier}")].extend(channel_smae.cpu().tolist())
                 else:
                     if task == "anomaly_detection" and args.anomaly_inference == "lopo":
                         lopo = model.reconstruct_context_lopo(
@@ -745,21 +784,24 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                     target = batch["reconstruction_target"]
                     mask = batch["reconstruction_target_mask"] & torch.isfinite(prediction)
                     if mask.any():
-                        error = (prediction[mask] - target[mask]).abs()
-                        smape = 2 * error / (prediction[mask].abs() + target[mask].abs()).clamp_min(1e-6)
-                        aggregates[(domain, task, "mae")].extend(error.cpu().tolist())
-                        aggregates[(domain, task, "smape")].extend(smape.cpu().tolist())
                         for channel_index, item in enumerate(row.get("channel_metadata") or []):
                             channel_mask = mask[channel_index]
+                            if not channel_mask.any():
+                                continue
+                            channel_error = (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs()
+                            scale = vocab.smae_scale(row, item, target[channel_index][channel_mask])
+                            channel_smae = channel_error / scale
+                            channel_smape = 2 * channel_error / (
+                                prediction[channel_index][channel_mask].abs() + target[channel_index][channel_mask].abs()
+                            ).clamp_min(1e-6)
+                            aggregates[(domain, task, "smae")].extend(channel_smae.cpu().tolist())
+                            aggregates[(domain, task, "smape")].extend(channel_smape.cpu().tolist())
+                            key = feature_key(domain, row, channel_index)
+                            feature_aggregates[key]["interpolation_smae"].extend(channel_smae.cpu().tolist())
+                            feature_aggregates[key]["interpolation_smape"].extend(channel_smape.cpu().tolist())
                             tier = item.get("anomaly_tier", "none")
-                            if channel_mask.any() and tier != "none":
-                                channel_error = (prediction[channel_index][channel_mask] - target[channel_index][channel_mask]).abs()
-                                aggregates[(domain, task, f"mae_{tier}")].extend(channel_error.cpu().tolist())
-                                key = feature_key(domain, row, channel_index)
-                                feature_aggregates[key]["interpolation_error"].extend(channel_error.cpu().tolist())
-                                feature_aggregates[key]["interpolation_smape"].extend(
-                                    (2 * channel_error / (prediction[channel_index][channel_mask].abs() + target[channel_index][channel_mask].abs()).clamp_min(1e-6)).cpu().tolist()
-                                )
+                            if tier != "none":
+                                aggregates[(domain, task, f"smae_{tier}")].extend(channel_smae.cpu().tolist())
                     if task == "anomaly_detection":
                         evaluation_mask = batch["evaluation_mask"] & torch.isfinite(prediction)
                         temporal_residual = _channel_normalized_residual(
@@ -893,16 +935,16 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
     per_feature = {}
     for key, values in feature_aggregates.items():
         entry = dict(feature_metadata[key])
-        if values.get("forecast_error"):
+        if values.get("forecast_smae"):
             entry["forecast"] = {
-                "count": len(values["forecast_error"]),
-                "mae": float(np.mean(values["forecast_error"])),
+                "count": len(values["forecast_smae"]),
+                "smae": float(np.mean(values["forecast_smae"])),
                 "smape": float(np.mean(values["forecast_smape"])),
             }
-        if values.get("interpolation_error"):
+        if values.get("interpolation_smae"):
             entry["interpolation"] = {
-                "count": len(values["interpolation_error"]),
-                "mae": float(np.mean(values["interpolation_error"])),
+                "count": len(values["interpolation_smae"]),
+                "smae": float(np.mean(values["interpolation_smae"])),
                 "smape": float(np.mean(values["interpolation_smape"])),
             }
         if values.get("anomaly_scores") and values.get("anomaly_labels"):
@@ -916,6 +958,11 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                 "physical_response_auroc": _binary_auc(values["anomaly_labels"], values["physical_response_scores"]),
             }
         per_feature[key] = entry
+    metrics["metric_definition"] = {
+        "smae": "mean(abs(prediction - target) / train_only_channel_scale)",
+        "scale_selection": "ACARS IQR then std/mean_abs; QAR std then mean_abs/IQR",
+        "smape": "2 * abs(prediction - target) / max(abs(prediction) + abs(target), 1e-6)",
+    }
     metrics["per_feature"] = per_feature
     return metrics
 
