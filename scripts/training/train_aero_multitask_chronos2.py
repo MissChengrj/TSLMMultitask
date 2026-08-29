@@ -28,6 +28,7 @@ from tslm_multitask.models import Chronos2MultiTaskModel
 
 
 TASKS = ("forecast", "interpolation", "anomaly_detection")
+BRIDGE_PHYSICAL_VARIABLES = {"N1", "N2", "TRA", "N1_COMMAND", "N1_TARGET", "BLEED_SWITCH", "AIR_GROUND"}
 DOMAINS = ("acars", "qar")
 METADATA_FIELDS = (
     "domain",
@@ -301,33 +302,200 @@ def _metadata_ids(row: dict, vocab: MetadataVocabulary, device: torch.device) ->
     }
 
 
+def _task_target_field(task: str) -> str:
+    return {
+        "forecast": "forecast_target_channels",
+        "interpolation": "interpolation_target_channels",
+        "anomaly_detection": "anomaly_target_channels",
+    }[task]
+
+
+def _qar_attention_layout(
+    row: dict,
+    task: str,
+    group_mode: str = "physical",
+) -> tuple[list[int], list[int], list[bool], torch.Tensor | None]:
+    """Build the runtime attention topology for one record.
+
+    baseline keeps one fully connected group, independent disables
+    cross-series mixing, physical duplicates shared covariates per response
+    subsystem, and relation/relation_pair use a directed relation mask.
+    """
+    columns = list(row["source_columns"])
+    metadata = row.get("channel_metadata") or [{} for _ in columns]
+    n_channels = len(columns)
+    domain = str(row.get("source_domain", "")).lower()
+
+    if group_mode == "independent":
+        return list(range(n_channels)), list(range(n_channels)), [False] * n_channels, None
+
+    if domain != "qar":
+        if group_mode in {"relation", "relation_pair"}:
+            return list(range(n_channels)), [0] * n_channels, [False] * n_channels, torch.ones(
+                (n_channels, n_channels), dtype=torch.bool
+            )
+        # ACARS is one compact health group; all healthy channels remain
+        # eligible task responses even when the schema has no explicit forecast list.
+        return list(range(n_channels)), [0] * n_channels, [False] * n_channels, None
+
+    if group_mode == "baseline":
+        target_names = set(row.get(_task_target_field(task)) or [])
+        target_indices = {index for index, column in enumerate(columns) if column in target_names}
+        return (
+            list(range(n_channels)),
+            [0] * n_channels,
+            [index not in target_indices for index in range(n_channels)],
+            None,
+        )
+
+    if group_mode in {"relation", "relation_pair"}:
+        return (
+            list(range(n_channels)),
+            [0] * n_channels,
+            [False] * n_channels,
+            _build_relation_mask(row, include_engine_pairs=group_mode == "relation_pair"),
+        )
+
+    target_names = set(row.get(_task_target_field(task)) or [])
+    target_indices = [index for index, column in enumerate(columns) if column in target_names]
+    if not target_indices:
+        return list(range(n_channels)), [0] * n_channels, [False] * n_channels, None
+
+    condition_names = set(row.get("condition_channels") or [])
+    condition_indices = [
+        index for index, (column, item) in enumerate(zip(columns, metadata))
+        if (
+            column in condition_names
+            or bool(item.get("condition_variable"))
+            or item.get("physical_variable") in BRIDGE_PHYSICAL_VARIABLES
+        )
+    ]
+    condition_indices = list(dict.fromkeys(condition_indices))
+    response_groups: dict[str, list[int]] = {}
+    for index in target_indices:
+        item = metadata[index]
+        group_name = str(item.get("group_id") or row.get("group_id") or "RESPONSE")
+        response_groups.setdefault(group_name, []).append(index)
+
+    expanded_indices: list[int] = []
+    expanded_group_ids: list[int] = []
+    expanded_is_condition: list[bool] = []
+    for runtime_group, indices in enumerate(response_groups.values()):
+        selected = condition_indices + [index for index in indices if index not in condition_indices]
+        for index in selected:
+            expanded_indices.append(index)
+            expanded_group_ids.append(runtime_group)
+            expanded_is_condition.append(index not in indices)
+    return expanded_indices, expanded_group_ids, expanded_is_condition, None
+
+
+def _build_relation_mask(row: dict, include_engine_pairs: bool = False) -> torch.Tensor:
+    """Build a directed condition/bridge/subsystem relation mask.
+
+    Rows index queries and columns index keys. Response channels can read
+    global conditions, bridge states, and their own subsystem. Condition
+    channels cannot read response channels. Optional pair links connect the
+    same physical variable across engines.
+    """
+    metadata = row.get("channel_metadata") or [{} for _ in row.get("source_columns", [])]
+    n_channels = len(metadata)
+    groups = [str(item.get("group_id") or item.get("subsystem") or "OTHER") for item in metadata]
+    condition_names = set(row.get("condition_channels") or [])
+    columns = list(row.get("source_columns") or [])
+    is_condition = [
+        column in condition_names
+        or bool(item.get("condition_variable"))
+        or groups[index] in {"G0", "G1", "G6"}
+        or item.get("physical_variable") in BRIDGE_PHYSICAL_VARIABLES
+        for index, (column, item) in enumerate(zip(columns, metadata))
+    ]
+    is_bridge = [
+        bool(item.get("bridge_variable"))
+        or groups[index] in {"G1", "G6"}
+        or item.get("physical_variable") in BRIDGE_PHYSICAL_VARIABLES
+        for index, item in enumerate(metadata)
+    ]
+    relation = torch.eye(n_channels, dtype=torch.bool)
+    for query in range(n_channels):
+        for key in range(n_channels):
+            same_subsystem = groups[query] == groups[key]
+            shared_condition = is_condition[key]
+            bridge_key = is_bridge[key]
+            allowed = same_subsystem or shared_condition
+            if bridge_key and not is_condition[query]:
+                allowed = True
+            if is_condition[query] and not is_condition[key]:
+                allowed = False
+            if include_engine_pairs:
+                query_item = metadata[query]
+                key_item = metadata[key]
+                query_variable = query_item.get("canonical_variable") or query_item.get("physical_variable")
+                key_variable = key_item.get("canonical_variable") or key_item.get("physical_variable")
+                query_engine = query_item.get("engine_id")
+                key_engine = key_item.get("engine_id")
+                if query_variable and query_variable == key_variable and query_engine and key_engine:
+                    if str(query_engine) != str(key_engine):
+                        allowed = True
+            relation[query, key] = bool(allowed)
+    return relation
+
+def _expand_matrix(matrix: np.ndarray, indices: list[int]) -> np.ndarray:
+    return np.asarray(matrix[indices], dtype=np.float32)
+
 def record_to_batch(
     row: dict,
     vocab: MetadataVocabulary,
     device: torch.device,
     rng: np.random.Generator,
     masked_anomaly_probability: float,
+    group_mode: str = "physical",
 ) -> dict:
-    columns = list(row["source_columns"])
+    base_columns = list(row["source_columns"])
+    base_metadata = row.get("channel_metadata") or [{} for _ in base_columns]
     task = row["task_type"]
+    expanded_indices, runtime_group_ids, expanded_is_condition, relation_mask = _qar_attention_layout(
+        row, task, group_mode=group_mode
+    )
+    columns = [base_columns[index] for index in expanded_indices]
+    metadata = [base_metadata[index] for index in expanded_indices]
+    response_mask = ~np.asarray(expanded_is_condition, dtype=bool)
+    model_row = dict(row)
+    model_row["source_columns"] = columns
+    model_row["channel_metadata"] = metadata
+    model_row["time_scale_tokens"] = {
+        column: (row.get("time_scale_tokens") or {}).get(base_columns[index])
+        for column, index in zip(columns, expanded_indices)
+    }
     result: dict[str, object] = {
         "task": task,
         "domain": row["source_domain"],
-        "metadata_ids": _metadata_ids(row, vocab, device),
+        "metadata_ids": _metadata_ids(model_row, vocab, device),
+        "model_columns": columns,
+        "model_metadata": metadata,
+        "expanded_original_indices": expanded_indices,
+        "expanded_is_condition": expanded_is_condition,
+        "expanded_group_count": len(set(runtime_group_ids)),
+        "group_mode": group_mode,
+        "relation_mask": relation_mask.to(device=device) if relation_mask is not None else None,
     }
 
     if task == "forecast":
-        context = _matrix(row["history"], columns)
-        context_mask = _mask(row["history_observation_mask"], columns) & _mask(
-            row["history_quality_mask"], columns
+        base_context = _matrix(row["history"], base_columns)
+        base_context_mask = _mask(row["history_observation_mask"], base_columns) & _mask(
+            row["history_quality_mask"], base_columns
         )
-        future = _matrix(row["target_future"], columns)
-        target_mask = (
-            _mask(row["target_observation_mask"], columns)
-            & _mask(row["target_quality_mask"], columns)
-            & _mask(row["task_mask"], columns)
-            & np.isfinite(future)
+        base_future = _matrix(row["target_future"], base_columns)
+        base_target_mask = (
+            _mask(row["target_observation_mask"], base_columns)
+            & _mask(row["target_quality_mask"], base_columns)
+            & _mask(row["task_mask"], base_columns)
+            & np.isfinite(base_future)
         )
+        context = _expand_matrix(base_context, expanded_indices)
+        context_mask = _expand_matrix(base_context_mask, expanded_indices).astype(bool)
+        future = _expand_matrix(base_future, expanded_indices)
+        target_mask = _expand_matrix(base_target_mask, expanded_indices).astype(bool)
+        target_mask &= response_mask[:, None]
         result.update(
             context=torch.as_tensor(context, device=device),
             context_mask=torch.as_tensor(context_mask, device=device),
@@ -338,15 +506,20 @@ def record_to_batch(
             reconstruction_mask=None,
         )
     elif task == "interpolation":
-        context = _matrix(row["observed_context"], columns)
-        context_mask = _mask(row["observed_observation_mask"], columns) & _mask(
-            row["observed_quality_mask"], columns
+        base_context = _matrix(row["observed_context"], base_columns)
+        base_context_mask = _mask(row["observed_observation_mask"], base_columns) & _mask(
+            row["observed_quality_mask"], base_columns
         )
-        target = context.copy()
-        for channel_index, column in enumerate(columns):
-            for index, value in zip(row["missing_indices"][column], row["target_values"][column]):
-                target[channel_index, int(index)] = _float(value)
-        target_mask = _mask(row["task_mask"], columns) & np.isfinite(target)
+        base_target = base_context.copy()
+        for channel_index, column in enumerate(base_columns):
+            for index, value in zip(row["missing_indices"].get(column, []), row["target_values"].get(column, [])):
+                base_target[channel_index, int(index)] = _float(value)
+        base_target_mask = _mask(row["task_mask"], base_columns) & np.isfinite(base_target)
+        context = _expand_matrix(base_context, expanded_indices)
+        context_mask = _expand_matrix(base_context_mask, expanded_indices).astype(bool)
+        target = _expand_matrix(base_target, expanded_indices)
+        target_mask = _expand_matrix(base_target_mask, expanded_indices).astype(bool)
+        target_mask &= response_mask[:, None]
         result.update(
             context=torch.as_tensor(context, device=device),
             context_mask=torch.as_tensor(context_mask, device=device),
@@ -357,15 +530,22 @@ def record_to_batch(
             reconstruction_mask=torch.as_tensor(target_mask, device=device),
         )
     else:
-        context = _matrix(row["observed_context"], columns)
-        clean = _matrix(row["clean_context"], columns)
-        context_mask = _mask(row["observation_mask"], columns) & _mask(row["quality_mask"], columns)
-        target_mask = _mask(row["task_mask"], columns) & np.isfinite(clean)
+        base_context = _matrix(row["observed_context"], base_columns)
+        base_clean = _matrix(row["clean_context"], base_columns)
+        base_context_mask = _mask(row["observation_mask"], base_columns) & _mask(row["quality_mask"], base_columns)
+        base_target_mask = _mask(row["task_mask"], base_columns) & np.isfinite(base_clean)
+        context = _expand_matrix(base_context, expanded_indices)
+        clean = _expand_matrix(base_clean, expanded_indices)
+        context_mask = _expand_matrix(base_context_mask, expanded_indices).astype(bool)
+        target_mask = _expand_matrix(base_target_mask, expanded_indices).astype(bool)
+        target_mask &= response_mask[:, None]
         hide_anomaly = bool(rng.random() < masked_anomaly_probability)
         input_mask = target_mask if hide_anomaly else np.zeros_like(target_mask)
         if hide_anomaly:
             context[input_mask] = np.nan
             context_mask[input_mask] = False
+        evaluation_mask = _expand_matrix(_mask(row["evaluation_mask"], base_columns), expanded_indices).astype(bool)
+        evaluation_mask &= response_mask[:, None] & np.isfinite(clean)
         result.update(
             context=torch.as_tensor(context, device=device),
             context_mask=torch.as_tensor(context_mask, device=device),
@@ -375,13 +555,10 @@ def record_to_batch(
             reconstruction_target_mask=torch.as_tensor(target_mask, device=device),
             reconstruction_mask=torch.as_tensor(input_mask, device=device),
             anomaly_labels=torch.as_tensor(target_mask, device=device),
-            evaluation_mask=torch.as_tensor(
-                _mask(row["evaluation_mask"], columns) & np.isfinite(clean), device=device
-            ),
+            evaluation_mask=torch.as_tensor(evaluation_mask, device=device),
         )
 
-    series_count = len(columns)
-    result["group_ids"] = torch.zeros(series_count, dtype=torch.long, device=device)
+    result["group_ids"] = torch.as_tensor(runtime_group_ids, dtype=torch.long, device=device)
     result["num_output_patches"] = max(
         1,
         math.ceil(
@@ -390,12 +567,12 @@ def record_to_batch(
     )
     return result
 
-
 def _model_kwargs(batch: dict) -> dict:
     return {
         "context": batch["context"],
         "context_mask": batch["context_mask"],
         "group_ids": batch["group_ids"],
+        "relation_mask": batch.get("relation_mask"),
         "num_output_patches": batch["num_output_patches"],
         "future_target": batch["future_target"],
         "future_target_mask": batch["future_target_mask"],
@@ -470,6 +647,7 @@ def train_stage(
     args,
     global_step: int,
     history: list[dict],
+    evaluation_callback=None,
 ) -> int:
     if steps <= 0:
         return global_step
@@ -487,7 +665,7 @@ def train_stage(
             task_weights,
             {"B-1400": args.qar_b1400_weight, "B-2694": args.qar_b2694_weight, "ACARS": 1.0},
         )
-        batch = record_to_batch(row, vocab, model.device, rng, args.masked_anomaly_probability)
+        batch = record_to_batch(row, vocab, model.device, rng, args.masked_anomaly_probability, group_mode=args.group_mode)
         task = str(batch["task"])
         model.forecast_loss_weight = 1.0 if task == "forecast" else 0.0
         model.recon_loss_weight = 0.0 if task == "forecast" else 1.0
@@ -535,6 +713,24 @@ def train_stage(
             print(json.dumps(entry, ensure_ascii=False), flush=True)
             running.clear()
             counts.clear()
+        if (
+            evaluation_callback is not None
+            and args.eval_every_steps > 0
+            and local_step % args.eval_every_steps == 0
+        ):
+            if evaluation_callback(local_step, global_step):
+                print(
+                    json.dumps(
+                        {
+                            "stage": stage,
+                            "local_step": local_step,
+                            "global_optimizer_step": global_step,
+                            "early_stopped": True,
+                        }
+                    ),
+                    flush=True,
+                )
+                return global_step
     return global_step
 
 
@@ -711,13 +907,17 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
     model.eval()
     rng = np.random.default_rng(args.seed + 900_001)
     aggregates = defaultdict(list)
+    schema_aggregates = defaultdict(list)
+    evaluation_selection = {}
     feature_aggregates = defaultdict(lambda: defaultdict(list))
     feature_metadata = {}
     threshold_groups: dict[str, list[tuple[float, int]]] = defaultdict(list)
 
-    def feature_key(domain: str, row: dict, channel_index: int) -> str:
-        column = row["source_columns"][channel_index]
-        item = (row.get("channel_metadata") or [])[channel_index]
+    def feature_key(domain: str, row: dict, channel_index: int, columns=None, metadata=None) -> str:
+        columns = columns or row["source_columns"]
+        metadata = metadata or (row.get("channel_metadata") or [])
+        column = columns[channel_index]
+        item = metadata[channel_index]
         key = f"{domain}|{item.get('physical_variable', column)}|{column}"
         feature_metadata[key] = {
             "domain": domain,
@@ -728,11 +928,38 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
             "anomaly_tier": item.get("anomaly_tier", "none"),
         }
         return key
+    eval_manifest = None
+    if getattr(args, "eval_manifest", None):
+        manifest_path = Path(args.eval_manifest)
+        if manifest_path.exists():
+            eval_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
     with torch.no_grad():
         for (domain, task), pool in pools.pools.items():
-            for index in range(min(args.eval_records, len(pool))):
+            pool_key = f"{domain}/{task}"
+            if eval_manifest is not None and pool_key in eval_manifest.get("records", {}):
+                requested_ids = set(eval_manifest["records"][pool_key])
+                indices = [index for index in range(len(pool)) if pool.read(index).get("sample_id") in requested_ids]
+                evaluation_selection[pool_key] = {
+                    "requested": len(requested_ids),
+                    "found": len(indices),
+                    "missing": len(requested_ids) - len(indices),
+                }
+            else:
+                indices = list(range(min(args.eval_records, len(pool))))
+                evaluation_selection[pool_key] = {
+                    "requested": len(indices),
+                    "found": len(indices),
+                    "missing": 0,
+                    "legacy_ordered_selection": True,
+                }
+            for index in indices:
                 row = pool.read(index)
-                batch = record_to_batch(row, vocab, model.device, rng, 1.0)
+                schema = _row_schema_id(row)
+                batch = record_to_batch(row, vocab, model.device, rng, 1.0, group_mode=args.group_mode)
+                metric_row = dict(row)
+                metric_row["source_columns"] = batch.get("model_columns", row["source_columns"])
+                metric_row["channel_metadata"] = batch.get("model_metadata", row.get("channel_metadata"))
                 if task == "forecast":
                     model.forecast_loss_weight = 1.0
                     model.recon_loss_weight = 0.0
@@ -741,7 +968,7 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                     target = batch["future_target"]
                     mask = batch["future_target_mask"] & torch.isfinite(prediction)
                     if mask.any():
-                        for channel_index, item in enumerate(row.get("channel_metadata") or []):
+                        for channel_index, item in enumerate(batch.get("model_metadata") or row.get("channel_metadata") or []):
                             channel_mask = mask[channel_index]
                             if not channel_mask.any():
                                 continue
@@ -753,7 +980,9 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             ).clamp_min(1e-6)
                             aggregates[(domain, task, "smae")].extend(channel_smae.cpu().tolist())
                             aggregates[(domain, task, "smape")].extend(channel_smape.cpu().tolist())
-                            key = feature_key(domain, row, channel_index)
+                            schema_aggregates[(domain, schema, task, "smae")].extend(channel_smae.cpu().tolist())
+                            schema_aggregates[(domain, schema, task, "smape")].extend(channel_smape.cpu().tolist())
+                            key = feature_key(domain, row, channel_index, batch.get("model_columns"), batch.get("model_metadata"))
                             feature_aggregates[key]["forecast_smae"].extend(channel_smae.cpu().tolist())
                             feature_aggregates[key]["forecast_smape"].extend(channel_smape.cpu().tolist())
                             tier = item.get("forecast_tier", "none")
@@ -765,6 +994,7 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             context=batch["context"],
                             context_mask=batch["context_mask"],
                             group_ids=batch["group_ids"],
+                            relation_mask=batch.get("relation_mask"),
                             metadata_ids=batch["metadata_ids"],
                         )
                         length = lopo.shape[-1]
@@ -780,13 +1010,14 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             context_mask=batch["context_mask"],
                             reconstruction_mask=batch["reconstruction_mask"],
                             group_ids=batch["group_ids"],
+                            relation_mask=batch.get("relation_mask"),
                             metadata_ids=batch["metadata_ids"],
                         )
                     prediction = quantile_preds[:, _median_index(model), :]
                     target = batch["reconstruction_target"]
                     mask = batch["reconstruction_target_mask"] & torch.isfinite(prediction)
                     if mask.any():
-                        for channel_index, item in enumerate(row.get("channel_metadata") or []):
+                        for channel_index, item in enumerate(batch.get("model_metadata") or row.get("channel_metadata") or []):
                             channel_mask = mask[channel_index]
                             if not channel_mask.any():
                                 continue
@@ -798,7 +1029,9 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                             ).clamp_min(1e-6)
                             aggregates[(domain, task, "smae")].extend(channel_smae.cpu().tolist())
                             aggregates[(domain, task, "smape")].extend(channel_smape.cpu().tolist())
-                            key = feature_key(domain, row, channel_index)
+                            schema_aggregates[(domain, schema, task, "smae")].extend(channel_smae.cpu().tolist())
+                            schema_aggregates[(domain, schema, task, "smape")].extend(channel_smape.cpu().tolist())
+                            key = feature_key(domain, row, channel_index, batch.get("model_columns"), batch.get("model_metadata"))
                             feature_aggregates[key]["interpolation_smae"].extend(channel_smae.cpu().tolist())
                             feature_aggregates[key]["interpolation_smape"].extend(channel_smape.cpu().tolist())
                             tier = item.get("anomaly_tier", "none")
@@ -830,6 +1063,8 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                         labels = batch["anomaly_labels"][evaluation_mask]
                         aggregates[(domain, task, "scores")].extend(scores.cpu().tolist())
                         aggregates[(domain, task, "labels")].extend(labels.long().cpu().tolist())
+                        schema_aggregates[(domain, schema, task, "scores")].extend(scores.cpu().tolist())
+                        schema_aggregates[(domain, schema, task, "labels")].extend(labels.long().cpu().tolist())
                         aggregates[(domain, task, "temporal_scores")].extend(
                             temporal_residual[evaluation_mask].cpu().tolist()
                         )
@@ -839,11 +1074,11 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
                         aggregates[(domain, task, "physical_response_scores")].extend(
                             physical_response_residual[evaluation_mask].cpu().tolist()
                         )
-                        for channel_index, item in enumerate(row.get("channel_metadata") or []):
+                        for channel_index, item in enumerate(batch.get("model_metadata") or row.get("channel_metadata") or []):
                             channel_mask = evaluation_mask[channel_index]
                             tier = item.get("anomaly_tier", "none")
                             if channel_mask.any() and tier != "none":
-                                key = feature_key(domain, row, channel_index)
+                                key = feature_key(domain, row, channel_index, batch.get("model_columns"), batch.get("model_metadata"))
                                 feature_aggregates[key]["anomaly_scores"].extend(
                                     combined_residual[channel_index][channel_mask].cpu().tolist()
                                 )
@@ -965,14 +1200,53 @@ def evaluate(model, pools: CanonicalPools, vocab: MetadataVocabulary, args) -> d
         "scale_selection": "ACARS IQR then std/mean_abs; QAR std then mean_abs/IQR",
         "smape": "2 * abs(prediction - target) / max(abs(prediction) + abs(target), 1e-6)",
     }
+    schema_metrics = {}
+    for (domain, schema, task, metric), values in schema_aggregates.items():
+        if metric in {"smae", "smape"}:
+            schema_metrics[f"{domain}/{schema}/{task}/{metric}"] = float(np.mean(values)) if values else float("nan")
+    for domain in DOMAINS:
+        for task in TASKS:
+            for metric in ("smae", "smape"):
+                values = [
+                    value for key, value in schema_metrics.items()
+                    if key.startswith(f"{domain}/") and key.endswith(f"/{task}/{metric}")
+                ]
+                if values:
+                    metrics[f"{domain}/{task}/{metric}_schema_macro"] = float(np.mean(values))
+            schema_names = sorted({key[1] for key in schema_aggregates if key[0] == domain and key[2] == task})
+            for schema in schema_names:
+                scores = schema_aggregates.get((domain, schema, task, "scores"), [])
+                labels = schema_aggregates.get((domain, schema, task, "labels"), [])
+                if scores and labels:
+                    schema_metrics[f"{domain}/{schema}/{task}/auroc"] = _binary_auc(labels, scores)
+                    schema_metrics[f"{domain}/{schema}/{task}/top_k_f1"] = _top_k_f1(labels, scores)
+    metrics["schema_metrics"] = schema_metrics
+    metrics["evaluation_selection"] = evaluation_selection
+    if getattr(args, "eval_manifest", None):
+        metrics["eval_manifest"] = str(args.eval_manifest)
     metrics["per_feature"] = per_feature
     return metrics
+
+
+def composite_smae(metrics: dict) -> float:
+    keys = (
+        "acars/forecast/smae",
+        "acars/interpolation/smae",
+        "acars/anomaly_detection/smae",
+        "qar/forecast/smae",
+        "qar/interpolation/smae",
+        "qar/anomaly_detection/smae",
+    )
+    values = [float(metrics[key]) for key in keys if np.isfinite(metrics.get(key, float("nan")))]
+    return float(np.mean(values)) if values else float("inf")
 
 
 def save_checkpoint(model, output_dir: Path, vocab: MetadataVocabulary, args, history, metrics):
     output_dir.mkdir(parents=True, exist_ok=True)
     model.config.architectures = ["Chronos2MultiTaskModel"]
-    model.config.aero_metadata_vocab_sizes = vocab.sizes
+    model.config.aero_metadata_vocab_sizes = dict(
+        getattr(model.config, "aero_metadata_vocab_sizes", vocab.sizes)
+    )
     model.save_pretrained(output_dir)
     vocab.save(output_dir / "metadata_vocab.json")
     (output_dir / "training_args.json").write_text(
@@ -1010,15 +1284,20 @@ def parse_args():
     parser.add_argument("--interpolation-weight", type=float, default=0.35)
     parser.add_argument("--anomaly-weight", type=float, default=0.25)
     parser.add_argument("--masked-anomaly-probability", type=float, default=0.70)
+    parser.add_argument("--group-mode", choices=["independent", "baseline", "physical", "relation", "relation_pair"], default="baseline")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--amp", choices=["none", "bf16", "fp16"], default="none")
     parser.add_argument("--eval-records", type=int, default=24)
+    parser.add_argument("--eval-manifest", default=None)
     parser.add_argument("--anomaly-inference", choices=["direct", "lopo"], default="lopo")
     parser.add_argument("--cross-engine-weight", type=float, default=0.35)
     parser.add_argument("--cross-variable-weight", type=float, default=0.50)
     parser.add_argument("--log-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--eval-every-steps", type=int, default=0)
+    parser.add_argument("--early-stopping-patience", type=int, default=0)
+    parser.add_argument("--early-stopping-min-improvement", type=float, default=0.01)
     return parser.parse_args()
 
 
@@ -1046,9 +1325,30 @@ def main():
     source_architectures = source_config.get("architectures") or []
     loading_base_chronos = "Chronos2MultiTaskModel" not in source_architectures
     config = Chronos2CoreConfig.from_pretrained(model_path)
-    config.aero_metadata_vocab_sizes = vocab.sizes
+    source_vocab_sizes = dict(source_config.get("aero_metadata_vocab_sizes") or {})
+    weights_path = model_path / "model.safetensors"
+    if weights_path.exists():
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(weights_path), framework="pt", device="cpu") as handle:
+                for weight_name in handle.keys():
+                    prefix = "metadata_embeddings."
+                    suffix = ".weight"
+                    if weight_name.startswith(prefix) and weight_name.endswith(suffix):
+                        vocab_name = weight_name[len(prefix) : -len(suffix)]
+                        source_vocab_sizes[vocab_name] = int(handle.get_slice(weight_name).get_shape()[0])
+        except Exception as exc:
+            print(json.dumps({"vocab_shape_probe_warning": str(exc)}), flush=True)
+    config.aero_metadata_vocab_sizes = {
+        key: max(
+            int(vocab.sizes.get(key, 0)),
+            int(source_vocab_sizes.get(key, 0)),
+        )
+        for key in set(vocab.sizes) | set(source_vocab_sizes)
+    }
     config.architectures = ["Chronos2MultiTaskModel"]
-    model = Chronos2MultiTaskModel.from_pretrained(model_path, config=config).to(device)
+    model = Chronos2MultiTaskModel.from_pretrained(model_path, config=config, ignore_mismatched_sizes=True).to(device)
     if loading_base_chronos:
         model.initialize_aero_modules_from_base()
     parameter_stats = configure_trainable(model, args.trainable_mode)
@@ -1058,6 +1358,7 @@ def main():
                 "device": str(device),
                 "parameter_stats": parameter_stats,
                 "reconstruction_head_initialized_from_forecast_head": loading_base_chronos,
+                "group_mode": args.group_mode,
             },
             indent=2,
         )
@@ -1092,6 +1393,54 @@ def main():
         configure_trainable(model, args.stage2_trainable_mode)
         optimizer = make_optimizer(model, args.backbone_learning_rate, args.new_module_learning_rate)
 
+    best_eval_score = composite_smae(baseline_metrics)
+    stale_evaluations = 0
+
+    def continuation_evaluation(local_step: int, current_global_step: int) -> bool:
+        nonlocal best_eval_score, stale_evaluations
+        metrics = evaluate(model, val_pools, vocab, args)
+        metrics["global_optimizer_steps"] = current_global_step
+        metrics["continuation_local_step"] = local_step
+        score = composite_smae(metrics)
+        metrics["composite_smae"] = score
+        history.append(
+            {
+                "stage": "validation",
+                "local_step": local_step,
+                "global_optimizer_step": current_global_step,
+                "composite_smae": score,
+            }
+        )
+        step_dir = output_root / f"checkpoint-step-{current_global_step:05d}"
+        save_checkpoint(model, step_dir, vocab, args, history, metrics)
+        improved = score < best_eval_score * (1.0 - args.early_stopping_min_improvement)
+        if improved:
+            best_eval_score = score
+            stale_evaluations = 0
+            save_checkpoint(model, output_root / "checkpoint-best", vocab, args, history, metrics)
+        else:
+            stale_evaluations += 1
+        print(
+            json.dumps(
+                {
+                    "stage": "validation",
+                    "local_step": local_step,
+                    "global_optimizer_step": current_global_step,
+                    "composite_smae": score,
+                    "best_composite_smae": best_eval_score,
+                    "improved": improved,
+                    "stale_evaluations": stale_evaluations,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        model.train()
+        return (
+            args.early_stopping_patience > 0
+            and stale_evaluations >= args.early_stopping_patience
+        )
+
     global_step = train_stage(
         model,
         train_pools,
@@ -1108,8 +1457,10 @@ def main():
         args,
         global_step,
         history,
+        evaluation_callback=continuation_evaluation,
     )
     final_metrics = evaluate(model, val_pools, vocab, args)
+    final_metrics["composite_smae"] = composite_smae(final_metrics)
     final_metrics["global_optimizer_steps"] = global_step
     save_checkpoint(model, output_root / "checkpoint-final", vocab, args, history, final_metrics)
     print(json.dumps({"saved": str(output_root / "checkpoint-final"), "metrics": final_metrics}, indent=2))
