@@ -64,6 +64,7 @@ class BuildConfig:
     qar_context_length: int | None = None
     max_group_channels: int = 16
     max_condition_channels: int = 4
+    include_joint_qar_source: bool = True
     prediction_length: int = 16
     windows_per_source: int = 1
     interpolation_mask_ratio: float = 0.2
@@ -768,6 +769,57 @@ def load_source_series(input_dir: Path, config: BuildConfig, catalog: dict[str, 
                     quality_invalid_count=int((group_observation_mask & ~group_quality_mask).sum()),
                 )
             )
+        if config.include_joint_qar_source and domain == "qar":
+            joint_indices = [
+                index
+                for index, item in enumerate(metadata)
+                if item.get("group_id") != "G7" and not item.get("label_only")
+            ]
+            if len(joint_indices) > 1:
+                joint_values = values[joint_indices]
+                joint_observation_mask = observation_mask[joint_indices]
+                joint_native_sampling_mask = native_sampling_mask[joint_indices]
+                joint_quality_mask = quality_mask[joint_indices]
+                joint_time_delta = time_delta[joint_indices]
+                if (
+                    joint_values.shape[1] >= config.context_length
+                    and int(joint_quality_mask.sum()) >= config.min_valid_points
+                ):
+                    joint_columns = [columns[index] for index in joint_indices]
+                    sources.append(
+                        SourceSeries(
+                            file_path=path,
+                            source_domain=domain,
+                            source_group_id=f"{path.stem}::JOINT",
+                            split=split_map.get(path.name, _stable_split(path.name, config)),
+                            group_id="JOINT",
+                            phase=phase,
+                            phases=phases,
+                            aircraft_id=identity["aircraft_id"],
+                            source_engine_id=identity["source_engine_id"],
+                            flight_id=identity["flight_id"],
+                            source_timestamp=identity["source_timestamp"],
+                            source_type=str(identity["source_type"]),
+                            time_index_type=time_index_type,
+                            time_column=time_column,
+                            time_unit=time_unit,
+                            base_time_interval=base_time_interval,
+                            columns=joint_columns,
+                            channel_metadata=[metadata[index] for index in joint_indices],
+                            values=joint_values,
+                            observation_mask=joint_observation_mask,
+                            native_sampling_mask=joint_native_sampling_mask,
+                            quality_mask=joint_quality_mask,
+                            time_delta=joint_time_delta,
+                            sampling_intervals={
+                                column: sampling_intervals[column] for column in joint_columns
+                            },
+                            native_missing_count=int((~joint_observation_mask).sum()),
+                            quality_invalid_count=int(
+                                (joint_observation_mask & ~joint_quality_mask).sum()
+                            ),
+                        )
+                    )
     return sources
 
 
@@ -837,7 +889,7 @@ def _base_record(task: str, index: int, source: SourceSeries, start: int, config
         "source_group_id": source.source_group_id,
         "split": source.split,
         "group_id": source.group_id,
-        "subsystem": GROUPS[source.group_id]["subsystem"],
+        "subsystem": GROUPS.get(source.group_id, {"subsystem": "JOINT_MULTI_RESPONSE"})["subsystem"],
         "phase": source.phase,
         "phases": source.phases,
         "time_index_type": source.time_index_type,
@@ -962,6 +1014,17 @@ def _choose_interpolation_indices(valid_candidates: np.ndarray, count: int, cont
     return sorted(rng.choice(valid_candidates, size=min(count, len(valid_candidates)), replace=False).astype(int).tolist())
 
 
+def _acars_feature_families(source: SourceSeries) -> dict[str, list[int]]:
+    """Return raw/derived ACARS channels grouped by their base physical variable."""
+    if str(source.source_domain).lower() != "acars":
+        return {}
+    families: dict[str, list[int]] = {}
+    for index, item in enumerate(source.channel_metadata):
+        family = item.get("channel_family") or item.get("physical_variable") or source.columns[index]
+        families.setdefault(str(family), []).append(index)
+    return families
+
+
 def build_interpolation_records(sources: list[SourceSeries], config: BuildConfig, rng: np.random.Generator) -> list[dict]:
     records = []
     for index, (source, start) in enumerate(_sample_windows(sources, "interpolation", config, rng)):
@@ -986,6 +1049,7 @@ def build_interpolation_records(sources: list[SourceSeries], config: BuildConfig
         evaluation_masks: dict[str, list[int]] = {}
         edge_guard = min(8, max(0, config.context_length // 8))
         candidates = np.arange(edge_guard, config.context_length - edge_guard)
+        acars_families = _acars_feature_families(source)
 
         for idx, col in enumerate(source.columns):
             valid_candidates = candidates[original_quality_mask[idx, candidates]]
@@ -1012,6 +1076,38 @@ def build_interpolation_records(sources: list[SourceSeries], config: BuildConfig
             observed_observation_mask[idx, chosen] = False
             observed_quality_mask[idx, chosen] = False
 
+        # ACARS raw/derived channels share one masking pattern so a visible
+        # smoothed or divergence feature cannot reveal a masked base value.
+        if acars_families:
+            for family_members in acars_families.values():
+                target_members = [
+                    member
+                    for member in family_members
+                    if source.channel_metadata[member].get("interpolation_target")
+                ]
+                if not target_members:
+                    continue
+                reference = next(
+                    (member for member in target_members if missing_indices[source.columns[member]]),
+                    target_members[0],
+                )
+                family_indices = [
+                    int(point)
+                    for point in missing_indices[source.columns[reference]]
+                    if all(original_quality_mask[member, int(point)] for member in family_members)
+                ]
+                for member in family_members:
+                    member_col = source.columns[member]
+                    member_chosen = family_indices
+                    missing_indices[member_col] = member_chosen
+                    targets[member_col] = _json_values(clean[member, member_chosen])
+                    evaluation_mask = np.zeros(config.context_length, dtype=np.int8)
+                    if member in target_members:
+                        evaluation_mask[member_chosen] = 1
+                    evaluation_masks[member_col] = evaluation_mask.tolist()
+                    observed[member, member_chosen] = np.nan
+                    observed_observation_mask[member, member_chosen] = False
+                    observed_quality_mask[member, member_chosen] = False
         record = _base_record("interpolation", index, source, start, config)
         record.update(
             {
@@ -1025,6 +1121,7 @@ def build_interpolation_records(sources: list[SourceSeries], config: BuildConfig
                 "task_mask": evaluation_masks,
                 "mask_ratio": config.interpolation_mask_ratio,
                 "interpolation_mode": interpolation_mode,
+                "mask_scope": "feature_family" if acars_families else "channel",
                 "metric_hints": ["smae_on_masked_observed", "smape_on_masked_observed"],
             }
         )
@@ -1075,6 +1172,7 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
         evaluation_masks: dict[str, list[int]] = {}
         edge_guard = min(8, max(0, config.context_length // 8))
         candidates = np.arange(edge_guard, config.context_length - edge_guard)
+        acars_families = _acars_feature_families(source)
 
         for idx, col in enumerate(source.columns):
             valid_candidates = candidates[original_quality_mask[idx, candidates]]
@@ -1116,6 +1214,64 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
             anomaly_values[col] = _json_values(corrupted[idx, chosen])
             evaluation_masks[col] = eval_mask.tolist()
 
+        # Corrupt an entire ACARS feature family at shared positions. This
+        # prevents clean derived channels from exposing the anomaly source.
+        if acars_families:
+            for family_members in acars_families.values():
+                target_members = [
+                    member
+                    for member in family_members
+                    if source.channel_metadata[member].get("anomaly_target")
+                ]
+                if not target_members:
+                    continue
+                reference = next(
+                    (member for member in target_members if anomaly_indices[source.columns[member]]),
+                    target_members[0],
+                )
+                chosen = [int(point) for point in anomaly_indices[source.columns[reference]]]
+                if not chosen:
+                    continue
+                for member in family_members:
+                    corrupted[member, :] = clean[member, :]
+                for member in family_members:
+                    scale = float(np.nanstd(clean[member]))
+                    if not math.isfinite(scale) or scale <= 1e-6:
+                        valid_values = clean[member][original_quality_mask[member]]
+                        scale = max(
+                            float(np.nanmean(np.abs(valid_values))) if len(valid_values) else 1.0,
+                            1.0,
+                        ) * 0.1
+                    if anomaly_mode == "frozen":
+                        reference_index = max(chosen[0] - 1, 0)
+                        corrupted[member, chosen] = clean[member, reference_index]
+                    elif anomaly_mode == "drift":
+                        offsets = sign * config.anomaly_sigma * scale * np.linspace(
+                            0.0, 1.0, len(chosen), dtype=np.float32
+                        )
+                        corrupted[member, chosen] = clean[member, chosen] + offsets
+                    elif anomaly_mode == "variance":
+                        noise = rng.normal(
+                            0.0, config.anomaly_sigma * scale, size=len(chosen)
+                        ).astype(np.float32)
+                        corrupted[member, chosen] = clean[member, chosen] + noise
+                    else:
+                        offset = sign * config.anomaly_sigma * scale
+                        corrupted[member, chosen] = clean[member, chosen] + offset
+                    member_col = source.columns[member]
+                    col_labels = np.zeros(config.context_length, dtype=np.int8)
+                    if member in target_members:
+                        col_labels[chosen] = 1
+                    eval_mask = (
+                        original_quality_mask[member].astype(np.int8)
+                        if source.channel_metadata[member].get("anomaly_target")
+                        else np.zeros(config.context_length, dtype=np.int8)
+                    )
+                    labels[member_col] = col_labels.tolist()
+                    anomaly_indices[member_col] = chosen if member in target_members else []
+                    anomaly_values[member_col] = _json_values(corrupted[member, chosen])
+                    evaluation_masks[member_col] = eval_mask.tolist()
+
         record = _base_record("anomaly_detection", index, source, start, config)
         record.update(
             {
@@ -1133,6 +1289,7 @@ def build_anomaly_records(sources: list[SourceSeries], config: BuildConfig, rng:
                 "anomaly_sigma": config.anomaly_sigma,
                 "anomaly_mode": anomaly_mode,
                 "anomaly_mechanism": "physical_inconsistency" if anomaly_mode == "cross_channel" else anomaly_mode,
+                "corruption_scope": "feature_family" if acars_families else "channel",
                 "metric_hints": ["precision", "recall", "f1", "auroc_on_observed_points"],
             }
         )
@@ -1213,7 +1370,7 @@ def _source_manifest(sources: list[SourceSeries]) -> list[dict]:
                 "source_timestamp": source.source_timestamp,
                 "flight_id": source.flight_id,
                 "group_id": source.group_id,
-                "subsystem": GROUPS[source.group_id]["subsystem"],
+                "subsystem": GROUPS.get(source.group_id, {"subsystem": "JOINT_MULTI_RESPONSE"})["subsystem"],
                 "phase": source.phase,
                 "phases": source.phases,
                 "time_index_type": source.time_index_type,
@@ -1415,6 +1572,11 @@ def build_datasets(config: BuildConfig) -> dict:
         "source_domains": sorted({source.source_domain for source in sources}),
         "source_catalog": "data/source_catalog.yaml",
         "source_group_count": len(sources),
+        "joint_qar_source": {
+            "enabled": config.include_joint_qar_source,
+            "group_id": "JOINT",
+            "channels": "all non-label QAR channels; runtime record_to_batch expands physical response groups",
+        },
         "source_file_count": len({source.file_path.name for source in sources}),
         "source_file_count_by_domain": {
             domain: len({source.file_path.name for source in sources if source.source_domain == domain}) for domain in DOMAINS
@@ -1511,6 +1673,8 @@ def parse_args() -> BuildConfig:
     parser.add_argument("--qar-context-length", type=int, default=None)
     parser.add_argument("--max-group-channels", type=int, default=16)
     parser.add_argument("--max-condition-channels", type=int, default=4)
+    parser.add_argument("--no-joint-qar-source", action="store_false", dest="include_joint_qar_source")
+    parser.set_defaults(include_joint_qar_source=True)
     parser.add_argument("--prediction-length", type=int, default=16)
     parser.add_argument("--windows-per-source", type=int, default=1)
     parser.add_argument("--interpolation-mask-ratio", type=float, default=0.2)
